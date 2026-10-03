@@ -110,6 +110,11 @@ export GGML_SYCL_T2_W8A8_MIN=1024         # full 1024-token prompt batches via o
   --jinja --chat-template-file docs/bonsai-arc-b580-windows/bonsai-chat-template.jinja
 ```
 
+Thinking is off in this command (and in `run-bonsai.bat`) because it is faster for coding. For maths and logic puzzles
+turn it on with `--chat-template-kwargs '{"enable_thinking":true}'`: in one tester's run a timer puzzle that the model
+brute-forced for ~6,000 tokens with thinking off was solved first try in ~1,000 tokens with it on (42 vs 55 t/s per token,
+but about 4x sooner overall).
+
 The chat template file is the model's own template with one change: a system message in the middle of a conversation
 becomes a note in a user turn instead of an error. Coding agents such as Claude Code send those (see below); plain chat
 is unaffected.
