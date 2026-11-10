@@ -1924,6 +1924,80 @@ bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(enum ggml_type src0_type
     }
 }
 
+#ifdef GGML_SYCL_DMMV_HAS_BF16
+// BF16 mat-vec for one F32 activation column. A work-group of WG threads owns one row and splits its columns
+// in 64-value chunks; BF16 is widened to F32 in the kernel and the activations are read as they are.
+// GGML_SYCL_BF16_ESIMD=0 turns it off.
+static bool ggml_sycl_bf16_esimd_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_SYCL_BF16_ESIMD"); return e ? atoi(e) != 0 : true; }();
+    return on;
+}
+
+template <int WG>
+static void mul_mat_vec_bf16_sycl_esimd(const void * vx, const float * y, float * dst, const int ncols,
+                                        const int nrows, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % 64 == 0);
+    const int nchunks = ncols / 64;
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG), h);
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) nrows * WG), sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                using namespace sycl::ext::intel::esimd;
+                const int        tid = it.get_local_id(0);
+                const int        row = it.get_group(0);
+                const uint16_t * x   = (const uint16_t *) vx + (size_t) row * ncols;
+
+                simd<float, 32> a0 = 0.0f, a1 = 0.0f;
+                for (int c = tid; c < nchunks; c += WG) {
+                    const int             o  = c * 64;
+                    const simd<float, 32> y0 = block_load<float, 32>(y + o);
+                    const simd<float, 32> y1 = block_load<float, 32>(y + o + 32);
+                    simd<uint32_t, 32> w0 = convert<uint32_t>(block_load<uint16_t, 32>(x + o)) << 16;
+                    simd<uint32_t, 32> w1 = convert<uint32_t>(block_load<uint16_t, 32>(x + o + 32)) << 16;
+                    simd<float, 32> f0 = w0.template bit_cast_view<float>();
+                    simd<float, 32> f1 = w1.template bit_cast_view<float>();
+                    a0 += f0 * y0;
+                    a1 += f1 * y1;
+                }
+                a0 += a1;
+                const float part = reduce<float>(a0, std::plus<>{});
+                if (WG == 1) {
+                    dst[row] = part;
+                    return;
+                }
+                lmem[tid] = part;
+                it.barrier(sycl::access::fence_space::local_space);
+                if (tid == 0) {
+                    float sum = 0.0f;
+                    for (int p = 0; p < WG; ++p) {
+                        sum += lmem[p];
+                    }
+                    dst[row] = sum;
+                }
+            });
+    });
+}
+
+// threads per row: enough to keep a few thousand threads busy on matrices of few rows, at most one per chunk
+static void launch_mul_mat_vec_bf16_sycl_esimd(const void * vx, const float * y, float * dst, const int ncols,
+                                               const int nrows, dpct::queue_ptr stream) {
+    const int nchunks = ncols / 64;
+    int wg = 1;
+    while (wg < 32 && wg * 2 <= nchunks && (int64_t) nrows * wg < 4096) {
+        wg *= 2;
+    }
+    switch (wg) {
+        case 1:  mul_mat_vec_bf16_sycl_esimd<1>(vx, y, dst, ncols, nrows, stream); break;
+        case 2:  mul_mat_vec_bf16_sycl_esimd<2>(vx, y, dst, ncols, nrows, stream); break;
+        case 4:  mul_mat_vec_bf16_sycl_esimd<4>(vx, y, dst, ncols, nrows, stream); break;
+        case 8:  mul_mat_vec_bf16_sycl_esimd<8>(vx, y, dst, ncols, nrows, stream); break;
+        case 16: mul_mat_vec_bf16_sycl_esimd<16>(vx, y, dst, ncols, nrows, stream); break;
+        default: mul_mat_vec_bf16_sycl_esimd<32>(vx, y, dst, ncols, nrows, stream); break;
+    }
+}
+#endif // GGML_SYCL_DMMV_HAS_BF16
+
 #endif // GGML_SYCL_DMMV_HAS_ESIMD
 
 void ggml_sycl_op_dequantize_mul_mat_vec(
@@ -1937,6 +2011,13 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const int64_t ne00 = src0->ne[0];
     const int64_t row_diff = row_high - row_low;
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+#if defined(GGML_SYCL_DMMV_HAS_ESIMD) && defined(GGML_SYCL_DMMV_HAS_BF16)
+    // The ESIMD BF16 kernel reads F32 activations.
+    const bool bf16_esimd = src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_esimd && ggml_sycl_bf16_esimd_enabled() &&
+                            ne00 % 64 == 0;
+#else
+    const bool bf16_esimd = false;
+#endif
     // on some GPUs it is faster to convert src1 to half and to use half precision intrinsics
 #ifdef GGML_SYCL_F16
     ggml_sycl_pool_alloc<sycl::half> src1_dfloat_a(ctx.pool());
@@ -1956,7 +2037,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
         src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
         src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 ||
         (src0->type == GGML_TYPE_Q8_0 && !q8_0_esimd) || src0->type == GGML_TYPE_F16 ||
-        src0->type == GGML_TYPE_BF16;
+        (src0->type == GGML_TYPE_BF16 && !bf16_esimd);
 
     if (src1_convert_f16) {
         scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
@@ -2096,6 +2177,12 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
             break;
 #ifdef GGML_SYCL_DMMV_HAS_BF16
         case GGML_TYPE_BF16:
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+            if (bf16_esimd) {
+                launch_mul_mat_vec_bf16_sycl_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
+                break;
+            }
+#endif
             convert_mul_mat_vec_bf16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
 #endif
