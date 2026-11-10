@@ -1902,6 +1902,23 @@ vec_dot_iq1_m_q8_1(const void *__restrict__ vbq,
 
 #define VDR_IQ4_NL_Q8_1_MMVQ 2
 
+// Four IQ4_NL codes (one per byte, bits 0..3) to their kvalues_iq4nl int8 values. The 16-entry codebook is held in
+// four 32-bit constants and indexed with shifts, so no table is read from memory.
+static __dpct_inline__ uint32_t iq4nl_codes_to_int8(const uint32_t x) {
+    // kvalues_iq4nl = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}
+    constexpr uint32_t K0 = 0xBFAD9881u, K1 = 0xF6EADDCFu, K2 = 0x26190D01u, K3 = 0x71594535u;
+    uint32_t r = 0;
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const uint32_t c    = (x >> (8 * b)) & 0xF;
+        const uint32_t lo   = (c & 4) ? K1 : K0;
+        const uint32_t hi   = (c & 4) ? K3 : K2;
+        const uint32_t word = (c & 8) ? hi : lo;
+        r |= ((word >> (8 * (c & 3))) & 0xFFu) << (8 * b);
+    }
+    return r;
+}
+
 static __dpct_inline__ float
 vec_dot_iq4_nl_q8_1(const void *__restrict__ vbq,
                     const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
@@ -1911,13 +1928,11 @@ vec_dot_iq4_nl_q8_1(const void *__restrict__ vbq,
     const uint16_t * q4 = (const uint16_t *)bq->qs + 2*iqs;
     const int32_t  * q8 = (const int32_t  *)bq8_1->qs + iqs;
 
-    const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
-
-    int v1, v2;
     int sumi1 = 0, sumi2 = 0;
     for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
         const uint32_t aux = q4[2*l] | (q4[2*l+1] << 16);
-        get_int_from_table_16(aux, values, v1, v2);
+        const int v1 = (int) iq4nl_codes_to_int8(aux & 0x0f0f0f0f);
+        const int v2 = (int) iq4nl_codes_to_int8((aux >> 4) & 0x0f0f0f0f);
         sumi1 = dpct::dp4a(v1, q8[l + 0], sumi1);
         sumi2 = dpct::dp4a(v2, q8[l + 4], sumi2);
     }
