@@ -4,7 +4,6 @@
 
 #include "ggml.h"
 
-#include <thread>
 #include <cstring>
 #include <climits>
 #include <cstdlib>
@@ -1129,49 +1128,11 @@ void llama_prefetch(llama_memory_ranges mr) {
                 llama_format_win_err(GetLastError()).c_str());
     }
 #else
-    // A lazily read table can ask for tens of thousands of single pages per batch, one madvise each; issued from one
-    // thread that is a large part of prompt time. LLAMA_PREFETCH_THREADS: threads that share the ranges (default 8,
-    // 1 = this thread only, 0 = no prefetch).
-    static const int n_threads_env = [] { const char * e = getenv("LLAMA_PREFETCH_THREADS"); return e ? atoi(e) : 8; }();
-    if (n_threads_env <= 0) {
-        return;
-    }
-    // LLAMA_PREFETCH_TOUCH=1: read one byte of every page instead of madvise. A page fault is a blocking read, but
-    // the threads fault in parallel; on filesystems where MADV_WILLNEED reads synchronously (ZFS) that is faster.
-    static const bool touch = [] { const char * e = getenv("LLAMA_PREFETCH_TOUCH"); return e && atoi(e) != 0; }();
-    const auto advise = [&mr, page](size_t first, size_t last) {
-        if (touch) {
-            unsigned sum = 0;
-            for (size_t i = first; i < last; ++i) {
-                const volatile unsigned char * p = (const volatile unsigned char *) mr[i].addr;
-                for (size_t off = 0; off < mr[i].size; off += page) {
-                    sum += p[off];
-                }
-            }
-            (void) sum;
+    for (const auto & range : mr) {
+        // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
+        if (madvise(const_cast<void *>(range.addr), range.size, MADV_WILLNEED) != 0) {
+            LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
             return;
-        }
-        for (size_t i = first; i < last; ++i) {
-            // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
-            if (madvise(const_cast<void *>(mr[i].addr), mr[i].size, MADV_WILLNEED) != 0) {
-                LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
-                return;
-            }
-        }
-    };
-    const size_t n_threads = std::min<size_t>((size_t) n_threads_env, (mr.size() + 63) / 64);
-    if (n_threads <= 1) {
-        advise(0, mr.size());
-    } else {
-        std::vector<std::thread> workers;
-        workers.reserve(n_threads - 1);
-        const size_t chunk = (mr.size() + n_threads - 1) / n_threads;
-        for (size_t t = 1; t < n_threads; ++t) {
-            workers.emplace_back(advise, std::min(mr.size(), t * chunk), std::min(mr.size(), (t + 1) * chunk));
-        }
-        advise(0, std::min(mr.size(), chunk));
-        for (auto & w : workers) {
-            w.join();
         }
     }
 #endif
