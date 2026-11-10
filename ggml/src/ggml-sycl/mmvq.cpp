@@ -2831,7 +2831,7 @@ static void launch_mul_mat_vec_q_moe(
 
 // Whole-window MoE mat-vec: one launch covers every (token, slot) route of a few-token step, and an expert that
 // several tokens route to is decoded once: the first token that names it (the leader) computes the dot products of
-// all of them. Followers do no work. IQ4_NL only for now. GGML_SYCL_MOE_WINDOW=0 turns it off.
+// all of them. Followers do no work. IQ4_NL, IQ2_S, IQ3_XXS and IQ3_S. GGML_SYCL_MOE_WINDOW=0 turns it off.
 static bool ggml_sycl_moe_window_enabled() {
     static const bool on = [] { const char * e = getenv("GGML_SYCL_MOE_WINDOW"); return e ? atoi(e) != 0 : true; }();
     return on;
@@ -2980,30 +2980,204 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
     });
 }
 
+// Decoders of the 256-value superblock formats for the window kernel: one call decodes the 32 values of sub-block
+// ib32 into eight packed int8 words, with one weight-side scale for words 0..3 and one for words 4..7.
+struct moe_window_iq2_s {
+    using block_t = block_iq2_s;
+    static __dpct_inline__ void decode(const block_t * bq2, const int ib32, int w[8], float & s1, float & s2) {
+        const uint8_t * signs = bq2->qs + QK_K / 8 + 4 * ib32;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t * grid = (const uint32_t *) (iq2s_grid + (bq2->qs[4 * ib32 + l] | ((bq2->qh[ib32] << (8 - 2 * l)) & 0x300)));
+            const uint32_t signs0 = dpct::vectorized_binary<sycl::uchar4>(
+                ((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
+            const uint32_t signs1 = dpct::vectorized_binary<sycl::uchar4>(
+                ((signs[l] >> 4) * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
+            w[2 * l + 0] = dpct::vectorized_binary<sycl::uchar4>(grid[0] ^ signs0, signs0, std::minus<>());
+            w[2 * l + 1] = dpct::vectorized_binary<sycl::uchar4>(grid[1] ^ signs1, signs1, std::minus<>());
+        }
+        const float d = (float) bq2->d * 0.25f;
+        s1 = d * (0.5f + (bq2->scales[ib32] & 0xf));
+        s2 = d * (0.5f + (bq2->scales[ib32] >> 4));
+    }
+};
+
+struct moe_window_iq3_xxs {
+    using block_t = block_iq3_xxs;
+    static __dpct_inline__ void decode(const block_t * bq2, const int ib32, int w[8], float & s1, float & s2) {
+        const uint8_t *  q3  = bq2->qs + 8 * ib32;
+        const uint16_t * gas = (const uint16_t *) (bq2->qs + QK_K / 4) + 2 * ib32;
+        uint32_t aux32 = gas[0] | (gas[1] << 16);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t grid1     = iq3xxs_grid[q3[2 * l + 0]];
+            const uint32_t grid2     = iq3xxs_grid[q3[2 * l + 1]];
+            const uint32_t sign_bits = iq_sign_bits(aux32);
+            const uint32_t signs0    = iq_sign_mask(sign_bits);
+            const uint32_t signs1    = iq_sign_mask(sign_bits >> 4);
+            w[2 * l + 0] = (grid1 ^ signs0) + (signs0 & 0x01010101);
+            w[2 * l + 1] = (grid2 ^ signs1) + (signs1 & 0x01010101);
+            aux32 >>= 7;
+        }
+        s1 = (float) bq2->d * (0.5f + aux32) * 0.5f;
+        s2 = s1;
+    }
+};
+
+struct moe_window_iq3_s {
+    using block_t = block_iq3_s;
+    static __dpct_inline__ void decode(const block_t * bq2, const int ib32, int w[8], float & s1, float & s2) {
+        const uint8_t * qs = bq2->qs + 8 * ib32;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t grid1  = iq3s_grid[qs[2 * l + 0] | ((bq2->qh[ib32] << (8 - 2 * l)) & 256)];
+            const uint32_t grid2  = iq3s_grid[qs[2 * l + 1] | ((bq2->qh[ib32] << (7 - 2 * l)) & 256)];
+            const uint32_t signs  = bq2->signs[4 * ib32 + l];
+            const uint32_t signs0 = iq_sign_mask(signs);
+            const uint32_t signs1 = iq_sign_mask(signs >> 4);
+            w[2 * l + 0] = (grid1 ^ signs0) + (signs0 & 0x01010101);
+            w[2 * l + 1] = (grid2 ^ signs1) + (signs1 & 0x01010101);
+        }
+        s1 = (float) bq2->d * (1 + 2 * ((bq2->scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf));
+        s2 = s1;
+    }
+};
+
+// Window kernel for the superblock formats above; same layout as launch_mul_mat_vec_iq4_nl_moe_window.
+template <typename DEC, int LPR>
+static void launch_mul_mat_vec_grid_moe_window(
+    const void * vx_base, const void * vy_base, const int32_t * ids_base, const size_t ids_token_stride,
+    const int32_t * fol, float * dst_base, const int ncols, const int nrows, const int n_ids, const int n_tokens,
+    const size_t expert_weight_stride, const size_t dst_row_stride, const size_t dst_token_stride,
+    const size_t y_row_bytes, const int y_rows_per_token, dpct::queue_ptr stream) {
+    using block_t = typename DEC::block_t;
+    constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
+    constexpr int NT_MAX      = GGML_SYCL_MOE_WINDOW_MAX_TOKENS;
+    const int row_groups = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t) n_ids * n_tokens, (size_t) row_groups * WARP_SIZE), sycl::range<2>(1, WARP_SIZE)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const int p     = item.get_global_id(0);
+                const int tok   = p / n_ids;
+                const int slot  = p - tok * n_ids;
+                const int lane  = item.get_local_id(1);
+                const int slice = lane % LPR;
+                const int row   = item.get_group(1) * ROWS_PER_SG + lane / LPR;
+                const int i02   = ((const int32_t *) ((const char *) ids_base + (size_t) tok * ids_token_stride))[slot];
+
+                int32_t fk[NT_MAX];
+                bool    leader = false;
+#pragma unroll
+                for (int k = 0; k < NT_MAX; ++k) {
+                    fk[k]  = k < n_tokens ? fol[p * n_tokens + k] : -1;
+                    leader = leader || fk[k] >= 0;
+                }
+
+                float tmp[NT_MAX];
+#pragma unroll
+                for (int k = 0; k < NT_MAX; ++k) {
+                    tmp[k] = 0.0f;
+                }
+
+                if (row < nrows && leader) {
+                    const block_t * x = (const block_t *) ((const char *) vx_base + (size_t) i02 * expert_weight_stride);
+                    constexpr int dots_per_block = QK_K / 32;
+                    const int     n_dots         = (ncols / QK_K) * dots_per_block;
+                    const int     ibx0           = row * (ncols / QK_K);
+                    for (int t = slice; t < n_dots; t += LPR) {
+                        const int i    = t / dots_per_block;
+                        const int ib32 = t % dots_per_block;
+                        int   w[8];
+                        float s1, s2;
+                        DEC::decode(&x[ibx0 + i], ib32, w, s1, s2); // once, for every token that routes here
+#pragma unroll
+                        for (int k = 0; k < NT_MAX; ++k) {
+                            if (fk[k] >= 0) {
+                                const size_t       yrow = (size_t) k * y_rows_per_token + (y_rows_per_token == 1 ? 0 : fk[k]);
+                                const block_q8_1 * y    = (const block_q8_1 *) ((const char *) vy_base + yrow * y_row_bytes) + t;
+                                const int *        q8   = (const int *) y->qs;
+                                int sum1 = dpct::dp4a(w[0], q8[0], 0);
+                                sum1     = dpct::dp4a(w[1], q8[1], sum1);
+                                sum1     = dpct::dp4a(w[2], q8[2], sum1);
+                                sum1     = dpct::dp4a(w[3], q8[3], sum1);
+                                int sum2 = dpct::dp4a(w[4], q8[4], 0);
+                                sum2     = dpct::dp4a(w[5], q8[5], sum2);
+                                sum2     = dpct::dp4a(w[6], q8[6], sum2);
+                                sum2     = dpct::dp4a(w[7], q8[7], sum2);
+                                tmp[k] += y->ds[0] * (s1 * sum1 + s2 * sum2);
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < NT_MAX; ++k) {
+                    float v = tmp[k];
+#pragma unroll
+                    for (int mask = LPR / 2; mask > 0; mask >>= 1) {
+                        v += dpct::permute_sub_group_by_xor(item.get_sub_group(), v, mask);
+                    }
+                    tmp[k] = v;
+                }
+                if (slice == 0 && row < nrows) {
+                    if (i02 == -1) { // skipped slot
+                        float * dst = (float *) ((char *) dst_base + (size_t) tok * dst_token_stride + (size_t) slot * dst_row_stride);
+                        dst[row]    = 0.0f;
+                    }
+#pragma unroll
+                    for (int k = 0; k < NT_MAX; ++k) {
+                        if (fk[k] >= 0) {
+                            float * dst = (float *) ((char *) dst_base + (size_t) k * dst_token_stride + (size_t) fk[k] * dst_row_stride);
+                            dst[row]    = tmp[k];
+                        }
+                    }
+                }
+            });
+    });
+}
+
 bool ggml_sycl_mul_mat_vec_q_id_window(
     enum ggml_type src0_type, const void * vx_base, const void * vy_base, const int32_t * ids_base,
     size_t ids_token_stride, int32_t * fol, float * dst_base, int ncols, int nrows, int n_ids, int n_tokens,
     size_t expert_weight_stride, size_t dst_row_stride, size_t dst_token_stride, size_t y_row_bytes,
     int y_rows_per_token, dpct::queue_ptr stream) {
-    if (src0_type != GGML_TYPE_IQ4_NL || !ggml_sycl_moe_window_enabled() || n_tokens < 2 ||
-        n_tokens > GGML_SYCL_MOE_WINDOW_MAX_TOKENS || ncols % QK4_NL != 0) {
+    const bool grid_type = src0_type == GGML_TYPE_IQ2_S || src0_type == GGML_TYPE_IQ3_XXS || src0_type == GGML_TYPE_IQ3_S;
+    if ((src0_type != GGML_TYPE_IQ4_NL && !grid_type) || !ggml_sycl_moe_window_enabled() || n_tokens < 2 ||
+        n_tokens > GGML_SYCL_MOE_WINDOW_MAX_TOKENS || ncols % (grid_type ? QK_K : QK4_NL) != 0) {
         return false;
     }
     launch_moe_window_schedule(ids_base, ids_token_stride, n_ids, n_tokens, fol, stream);
-    const int n_dots = (ncols / QK4_NL) * (QI4_NL / VDR_IQ4_NL_Q8_1_MMVQ);
-    int       lpr    = 1;
-    while (lpr < 8 && n_dots > lpr * (ggml_sycl_moe_row_dots() > 0 ? ggml_sycl_moe_row_dots() : 20)) {
+    const int n_dots   = grid_type ? (ncols / QK_K) * (QK_K / 32) : (ncols / QK4_NL) * (QI4_NL / VDR_IQ4_NL_Q8_1_MMVQ);
+    const int row_dots = ggml_sycl_moe_row_dots() > 0 ? ggml_sycl_moe_row_dots() : 20;
+    int       lpr      = 1;
+    while (lpr < 8 && n_dots > lpr * row_dots) {
         lpr *= 2;
     }
-#define GGML_SYCL_MOE_WINDOW(L) launch_mul_mat_vec_iq4_nl_moe_window<L>(vx_base, vy_base, ids_base, ids_token_stride, fol, dst_base, \
-        ncols, nrows, n_ids, n_tokens, expert_weight_stride, dst_row_stride, dst_token_stride, y_row_bytes, y_rows_per_token, stream)
-    switch (lpr) {
-        case 1:  GGML_SYCL_MOE_WINDOW(1); break;
-        case 2:  GGML_SYCL_MOE_WINDOW(2); break;
-        case 4:  GGML_SYCL_MOE_WINDOW(4); break;
-        default: GGML_SYCL_MOE_WINDOW(8); break;
+#define GGML_SYCL_MOE_WINDOW_ARGS vx_base, vy_base, ids_base, ids_token_stride, fol, dst_base, ncols, nrows, n_ids, n_tokens, \
+        expert_weight_stride, dst_row_stride, dst_token_stride, y_row_bytes, y_rows_per_token, stream
+#define GGML_SYCL_MOE_WINDOW_LPR(F) \
+    switch (lpr) { \
+        case 1:  F(1); break; \
+        case 2:  F(2); break; \
+        case 4:  F(4); break; \
+        default: F(8); break; \
     }
-#undef GGML_SYCL_MOE_WINDOW
+#define GGML_SYCL_MOE_WINDOW_NL(L)  launch_mul_mat_vec_iq4_nl_moe_window<L>(GGML_SYCL_MOE_WINDOW_ARGS)
+#define GGML_SYCL_MOE_WINDOW_2S(L)  launch_mul_mat_vec_grid_moe_window<moe_window_iq2_s, L>(GGML_SYCL_MOE_WINDOW_ARGS)
+#define GGML_SYCL_MOE_WINDOW_3XX(L) launch_mul_mat_vec_grid_moe_window<moe_window_iq3_xxs, L>(GGML_SYCL_MOE_WINDOW_ARGS)
+#define GGML_SYCL_MOE_WINDOW_3S(L)  launch_mul_mat_vec_grid_moe_window<moe_window_iq3_s, L>(GGML_SYCL_MOE_WINDOW_ARGS)
+    switch (src0_type) {
+        case GGML_TYPE_IQ4_NL:  GGML_SYCL_MOE_WINDOW_LPR(GGML_SYCL_MOE_WINDOW_NL); break;
+        case GGML_TYPE_IQ2_S:   GGML_SYCL_MOE_WINDOW_LPR(GGML_SYCL_MOE_WINDOW_2S); break;
+        case GGML_TYPE_IQ3_XXS: GGML_SYCL_MOE_WINDOW_LPR(GGML_SYCL_MOE_WINDOW_3XX); break;
+        default:                GGML_SYCL_MOE_WINDOW_LPR(GGML_SYCL_MOE_WINDOW_3S); break;
+    }
+#undef GGML_SYCL_MOE_WINDOW_NL
+#undef GGML_SYCL_MOE_WINDOW_2S
+#undef GGML_SYCL_MOE_WINDOW_3XX
+#undef GGML_SYCL_MOE_WINDOW_3S
+#undef GGML_SYCL_MOE_WINDOW_LPR
+#undef GGML_SYCL_MOE_WINDOW_ARGS
     return true;
 }
 
