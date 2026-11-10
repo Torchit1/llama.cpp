@@ -5639,8 +5639,8 @@ static bool ggml_sycl_mul_mat_id_mmvq_eligible(
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
 
-    // a few tokens (e.g. the verify step of speculative decoding) stay on the mat-vec kernels: one launch covers
-    // every (token, expert slot) pair. GGML_SYCL_MMID_MMVQ_MAX_TOKENS=1 restores the single-token limit.
+    // a few tokens (e.g. the verify step of speculative decoding) stay on the mat-vec kernels, one launch per token.
+    // GGML_SYCL_MMID_MMVQ_MAX_TOKENS=1 restores the single-token limit.
     static const int64_t max_tokens = [] { const char * e = getenv("GGML_SYCL_MMID_MMVQ_MAX_TOKENS"); return e ? (int64_t) atoi(e) : 8; }();
     if (ne12 < 1 || ne12 > max_tokens) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
@@ -5651,11 +5651,7 @@ static bool ggml_sycl_mul_mat_id_mmvq_eligible(
     if (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t)) return false;
     if (ids->ne[1] != ne12) return false;
     if (ne11 != 1 && ne11 != n_ids_per_group) return false;
-    if (ne12 > 1) {
-        // rows of ids and dst are addressed by a flat (token, slot) index
-        if (ids->nb[1] != (size_t) n_ids_per_group * sizeof(int32_t)) return false;
-        if (!ggml_is_contiguous(dst) || dst->ne[1] != n_ids_per_group || dst->ne[2] != ne12) return false;
-    }
+    if (dst->ne[1] != n_ids_per_group || dst->ne[2] != ne12) return false;
 
     return true;
 }
@@ -5706,22 +5702,19 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const size_t bytes_per_qrow = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
     const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
 
-    // src1 per slot: every (token, slot) pair has its own row, one launch. src1 shared by the slots of a token:
-    // one launch per token.
-    const int n_launches = (ne11 == 1) ? (int) ne12 : 1;
-    const int n_pairs    = (ne11 == 1) ? n_experts_used : n_experts_used * (int) ne12;
-    for (int t = 0; t < n_launches; t++) {
-        const char *    src1_t = src1_ddq + (size_t) t * bytes_per_qrow;
-        const int32_t * ids_t  = (const int32_t *) ids->data + (size_t) t * n_experts_used;
-        float *         dst_t  = (float *) ((char *) dst->data + (size_t) t * n_experts_used * dst->nb[1]);
+    // one launch per token: the ids and dst rows of a token are contiguous, consecutive tokens need not be
+    for (int t = 0; t < (int) ne12; t++) {
+        const char *    src1_t = src1_ddq + (size_t) t * ne11 * bytes_per_qrow;
+        const int32_t * ids_t  = (const int32_t *) ((const char *) ids->data + (size_t) t * ids->nb[1]);
+        float *         dst_t  = (float *) ((char *) dst->data + (size_t) t * dst->nb[2]);
         const bool ok = use_reorder ?
             ggml_sycl_mul_mat_vec_q_id_reorder(
-                src0->type, src0->data, src1_t, ids_t, dst_t, (int) ne10, nrows, n_pairs,
+                src0->type, src0->data, src1_t, ids_t, dst_t, (int) ne10, nrows, n_experts_used,
                 /*expert_weight_stride=*/ src0->nb[2],
                 /*dst_row_stride=*/ dst->nb[1],
                 src1_row_stride, stream) :
             ggml_sycl_mul_mat_vec_q_id(
-                src0->type, src0->data, src1_t, ids_t, dst_t, (int) ne10, nrows, n_pairs,
+                src0->type, src0->data, src1_t, ids_t, dst_t, (int) ne10, nrows, n_experts_used,
                 /*expert_weight_stride=*/ src0->nb[2],
                 /*dst_row_stride=*/ dst->nb[1],
                 src1_row_stride, stream);
