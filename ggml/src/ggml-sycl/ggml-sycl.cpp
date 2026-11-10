@@ -5642,15 +5642,19 @@ static bool ggml_sycl_mul_mat_id_mmvq_eligible(
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
 
-    if (ne12 != 1) return false;
+    // a few tokens (e.g. the verify step of speculative decoding) stay on the mat-vec kernels, one launch per token.
+    // GGML_SYCL_MMID_MMVQ_MAX_TOKENS=1 restores the single-token limit.
+    static const int64_t max_tokens = [] { const char * e = getenv("GGML_SYCL_MMID_MMVQ_MAX_TOKENS"); return e ? (int64_t) atoi(e) : 8; }();
+    if (ne12 < 1 || ne12 > max_tokens) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
     if (!ggml_is_contiguous(src1)) return false;
 
     const int64_t n_ids_per_group = ids->ne[0];
     if (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t)) return false;
-    if (ids->ne[1] != 1) return false;
+    if (ids->ne[1] != ne12) return false;
     if (ne11 != 1 && ne11 != n_ids_per_group) return false;
+    if (dst->ne[1] != n_ids_per_group || dst->ne[2] != ne12) return false;
 
     return true;
 }
@@ -5671,6 +5675,7 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
 
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
     const int64_t n_ids_per_group = ids->ne[0];
     const queue_ptr stream           = ctx.stream();
     const int       src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
@@ -5685,35 +5690,43 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
 
     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
-        (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+        (size_t) ne11 * ne12 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
     char * src1_ddq = src1_q8_alloc.get();
     if (use_reorder) {
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
             src1_padded_cols, stream);
     } else {
         quantize_row_q8_1_sycl<quantize_q8_1>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
             src1_padded_cols, stream);
     }
 
     const size_t bytes_per_qrow = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
     const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
 
-    if (use_reorder) {
-        return ggml_sycl_mul_mat_vec_q_id_reorder(
-            src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
-            (float *) dst->data, (int) ne10, nrows, n_experts_used,
-            /*expert_weight_stride=*/ src0->nb[2],
-            /*dst_row_stride=*/ dst->nb[1],
-            src1_row_stride, stream);
+    // one launch per token: the ids and dst rows of a token are contiguous, consecutive tokens need not be
+    for (int t = 0; t < (int) ne12; t++) {
+        const char *    src1_t = src1_ddq + (size_t) t * ne11 * bytes_per_qrow;
+        const int32_t * ids_t  = (const int32_t *) ((const char *) ids->data + (size_t) t * ids->nb[1]);
+        float *         dst_t  = (float *) ((char *) dst->data + (size_t) t * dst->nb[2]);
+        const bool ok = use_reorder ?
+            ggml_sycl_mul_mat_vec_q_id_reorder(
+                src0->type, src0->data, src1_t, ids_t, dst_t, (int) ne10, nrows, n_experts_used,
+                /*expert_weight_stride=*/ src0->nb[2],
+                /*dst_row_stride=*/ dst->nb[1],
+                src1_row_stride, stream) :
+            ggml_sycl_mul_mat_vec_q_id(
+                src0->type, src0->data, src1_t, ids_t, dst_t, (int) ne10, nrows, n_experts_used,
+                /*expert_weight_stride=*/ src0->nb[2],
+                /*dst_row_stride=*/ dst->nb[1],
+                src1_row_stride, stream);
+        if (!ok) {
+            GGML_ASSERT(t == 0);
+            return false;
+        }
     }
-    return ggml_sycl_mul_mat_vec_q_id(
-        src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
-        (float *) dst->data, (int) ne10, nrows, n_experts_used,
-        /*expert_weight_stride=*/ src0->nb[2],
-        /*dst_row_stride=*/ dst->nb[1],
-        src1_row_stride, stream);
+    return true;
 }
 
 // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
@@ -5796,10 +5809,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ne12 == 1) {
-        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
-            return;
-        }
+    if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+        return;
     }
     GGML_ASSERT(!ggml_sycl_mul_mat_id_should_use_mmvq(dst));
 

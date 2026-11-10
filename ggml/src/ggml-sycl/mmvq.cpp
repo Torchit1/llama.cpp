@@ -1984,6 +1984,50 @@ static void mul_mat_vec_iq4_nl_q8_1_sycl(const void *vx, const void *vy,
     }
 }
 
+template <int ncols_dst>
+static void mul_mat_vec_iq4_nl_q8_1_sycl_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK4_NL == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item_ct1)
+                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_ncols<QK4_NL, QI4_NL, block_iq4_nl,
+                                        VDR_IQ4_NL_Q8_1_MMVQ,
+                                        vec_dot_iq4_nl_q8_1,
+                                        ncols_dst>(
+                        vx, vy, dst, ncols, nrows,
+                        stride_col_y, stride_col_dst, item_ct1);
+                });
+    });
+}
+
+static void mul_mat_vec_iq4_nl_q8_1_sycl_switch_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int ncols_dst,
+        const int stride_col_y, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    switch (ncols_dst) {
+        case 2: mul_mat_vec_iq4_nl_q8_1_sycl_ncols<2>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 3: mul_mat_vec_iq4_nl_q8_1_sycl_ncols<3>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 4: mul_mat_vec_iq4_nl_q8_1_sycl_ncols<4>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 5: mul_mat_vec_iq4_nl_q8_1_sycl_ncols<5>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 6: mul_mat_vec_iq4_nl_q8_1_sycl_ncols<6>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 7: mul_mat_vec_iq4_nl_q8_1_sycl_ncols<7>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 8: mul_mat_vec_iq4_nl_q8_1_sycl_ncols<8>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
 static void mul_mat_vec_iq4_xs_q8_1_sycl(const void *vx, const void *vy,
                                           float *dst, const int ncols,
                                           const int nrows,
@@ -2561,7 +2605,16 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 }
                 break;
             case GGML_TYPE_IQ4_NL:
-                mul_mat_vec_iq4_nl_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                    const int stride_col_y   = src1_padded_col_size / QK8_1;
+                    const int stride_col_dst = dst->ne[0];
+                    mul_mat_vec_iq4_nl_q8_1_sycl_switch_ncols(
+                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                        src1_ncols, stride_col_y, stride_col_dst, stream);
+                    return;
+                } else if (i == 0 || src1_ncols == 1) {
+                    mul_mat_vec_iq4_nl_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                }
                 break;
             case GGML_TYPE_IQ4_XS:
                 if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
@@ -2685,6 +2738,58 @@ static void mul_mat_vec_q_moe(
     }
 }
 
+// Short rows: LPR lanes share a row (LPR = 1, 2, 4 or 8), so a sub-group covers 32 / LPR rows. With few blocks per
+// row the sub-group-per-row kernel above leaves each lane one or two dot products and then pays for a 5-step
+// cross-lane reduction; with LPR = 1 there is no reduction at all.
+// GGML_SYCL_MOE_ROW_DOTS: dot products one lane should do per row (default 20, 0 = always the kernel above).
+static int ggml_sycl_moe_row_dots() {
+    static const int v = [] { const char * e = getenv("GGML_SYCL_MOE_ROW_DOTS"); return e ? atoi(e) : 20; }();
+    return v;
+}
+
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl, int LPR>
+static void launch_mul_mat_vec_q_moe_rows(
+    const void * vx_base, const void * vy_base, const int32_t * ids_dev,
+    float * dst_base, const int ncols, const int nrows, const int n_experts_used,
+    const size_t expert_weight_stride, const size_t dst_row_stride,
+    const size_t src1_row_stride,
+    dpct::queue_ptr stream) {
+    constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
+    const int row_groups = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>((size_t) n_experts_used, (size_t) row_groups * WARP_SIZE), sycl::range<2>(1, WARP_SIZE)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const int expert_idx = item.get_global_id(0);
+                const int lane       = item.get_local_id(1);
+                const int slice      = lane % LPR;
+                const int row        = item.get_group(1) * ROWS_PER_SG + lane / LPR;
+                const int i02        = ids_dev[expert_idx];
+
+                float tmp = 0.0f;
+                if (row < nrows && i02 != -1) {
+                    const block_q_t *  x = (const block_q_t *) ((const char *) vx_base + (size_t) i02 * expert_weight_stride);
+                    const block_q8_1 * y = (const block_q8_1 *) ((const char *) vy_base + (size_t) expert_idx * src1_row_stride);
+                    constexpr int dots_per_block = qi / vdr;
+                    const int     n_dots         = (ncols / qk) * dots_per_block;
+                    const int     ibx0           = row * (ncols / qk);
+                    for (int t = slice; t < n_dots; t += LPR) {
+                        const int i = t / dots_per_block;
+                        tmp += vec_dot_q_sycl(&x[ibx0 + i], &y[i * (qk / QK8_1)], vdr * (t % dots_per_block));
+                    }
+                }
+#pragma unroll
+                for (int mask = LPR / 2; mask > 0; mask >>= 1) {
+                    tmp += dpct::permute_sub_group_by_xor(item.get_sub_group(), tmp, mask);
+                }
+                if (slice == 0 && row < nrows) {
+                    float * dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
+                    dst[row] = tmp; // 0 for a skipped slot
+                }
+            });
+    });
+}
+
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
 static void launch_mul_mat_vec_q_moe(
     const void * vx_base, const void * vy, const int32_t * ids_dev,
@@ -2692,6 +2797,24 @@ static void launch_mul_mat_vec_q_moe(
     const size_t expert_weight_stride, const size_t dst_row_stride,
     const size_t src1_row_stride,
     dpct::queue_ptr stream) {
+    if (ggml_sycl_moe_row_dots() > 0) {
+        // lanes per row: the fewest that keep a lane at or under the target number of dot products
+        const int n_dots = (ncols / qk) * (qi / vdr);
+        int       lpr    = 1;
+        while (lpr < WARP_SIZE && n_dots > lpr * ggml_sycl_moe_row_dots()) {
+            lpr *= 2;
+        }
+#define GGML_SYCL_MOE_ROWS(L) launch_mul_mat_vec_q_moe_rows<qk, qi, block_q_t, vdr, vec_dot_q_sycl, L>( \
+            vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, expert_weight_stride, dst_row_stride, src1_row_stride, stream)
+        switch (lpr) {
+            case 1: GGML_SYCL_MOE_ROWS(1); return;
+            case 2: GGML_SYCL_MOE_ROWS(2); return;
+            case 4: GGML_SYCL_MOE_ROWS(4); return;
+            case 8: GGML_SYCL_MOE_ROWS(8); return;
+            default: break; // long rows: one sub-group per row
+        }
+#undef GGML_SYCL_MOE_ROWS
+    }
     const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
