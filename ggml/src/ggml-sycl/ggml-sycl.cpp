@@ -5702,6 +5702,18 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const size_t bytes_per_qrow = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
     const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
 
+    if (!use_reorder && ne12 > 1) {
+        // whole window in one launch, shared experts decoded once
+        ggml_sycl_pool_alloc<int32_t> fol(ctx.pool(), (size_t) n_experts_used * ne12 * ne12);
+        if (ggml_sycl_mul_mat_vec_q_id_window(
+                src0->type, src0->data, src1_ddq, (const int32_t *) ids->data, ids->nb[1], fol.get(),
+                (float *) dst->data, (int) ne10, nrows, n_experts_used, (int) ne12,
+                /*expert_weight_stride=*/ src0->nb[2], /*dst_row_stride=*/ dst->nb[1], /*dst_token_stride=*/ dst->nb[2],
+                bytes_per_qrow, (int) ne11, stream)) {
+            return true;
+        }
+    }
+
     // one launch per token: the ids and dst rows of a token are contiguous, consecutive tokens need not be
     for (int t = 0; t < (int) ne12; t++) {
         const char *    src1_t = src1_ddq + (size_t) t * ne11 * bytes_per_qrow;
