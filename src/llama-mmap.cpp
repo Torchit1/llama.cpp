@@ -1136,7 +1136,21 @@ void llama_prefetch(llama_memory_ranges mr) {
     if (n_threads_env <= 0) {
         return;
     }
-    const auto advise = [&mr](size_t first, size_t last) {
+    // LLAMA_PREFETCH_TOUCH=1: read one byte of every page instead of madvise. A page fault is a blocking read, but
+    // the threads fault in parallel; on filesystems where MADV_WILLNEED reads synchronously (ZFS) that is faster.
+    static const bool touch = [] { const char * e = getenv("LLAMA_PREFETCH_TOUCH"); return e && atoi(e) != 0; }();
+    const auto advise = [&mr, page](size_t first, size_t last) {
+        if (touch) {
+            unsigned sum = 0;
+            for (size_t i = first; i < last; ++i) {
+                const volatile unsigned char * p = (const volatile unsigned char *) mr[i].addr;
+                for (size_t off = 0; off < mr[i].size; off += page) {
+                    sum += p[off];
+                }
+            }
+            (void) sum;
+            return;
+        }
         for (size_t i = first; i < last; ++i) {
             // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
             if (madvise(const_cast<void *>(mr[i].addr), mr[i].size, MADV_WILLNEED) != 0) {
@@ -1145,7 +1159,7 @@ void llama_prefetch(llama_memory_ranges mr) {
             }
         }
     };
-    const size_t n_threads = std::min<size_t>((size_t) n_threads_env, (mr.size() + 255) / 256);
+    const size_t n_threads = std::min<size_t>((size_t) n_threads_env, (mr.size() + 63) / 64);
     if (n_threads <= 1) {
         advise(0, mr.size());
     } else {
