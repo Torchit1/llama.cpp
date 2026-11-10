@@ -30,6 +30,15 @@ void ggml_sycl_op_mul_mat_vec_q(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream);
 
+// Whole-window variant for a step of 2..8 tokens: one launch, an expert shared by several tokens is decoded once.
+// fol is device scratch of n_ids * n_tokens * n_tokens int32. Standard (non-reorder) layout only.
+// Returns false if the type or shape isn't handled; caller should fall back.
+bool ggml_sycl_mul_mat_vec_q_id_window(
+    enum ggml_type src0_type, const void * vx_base, const void * vy_base, const int32_t * ids_base,
+    size_t ids_token_stride, int32_t * fol, float * dst_base, int ncols, int nrows, int n_ids, int n_tokens,
+    size_t expert_weight_stride, size_t dst_row_stride, size_t dst_token_stride, size_t y_row_bytes,
+    int y_rows_per_token, dpct::queue_ptr stream);
+
 // Requires standard (non-reorder) block layout for src0.
 // Returns false if src0_type isn't handled; caller should fall back.
 bool ggml_sycl_mul_mat_vec_q_id(
