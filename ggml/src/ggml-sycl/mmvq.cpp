@@ -2839,19 +2839,6 @@ static bool ggml_sycl_moe_window_enabled() {
 
 static constexpr int GGML_SYCL_MOE_WINDOW_MAX_TOKENS = 8;
 
-// Unaligned wide loads: one load per 4 or 8 bytes instead of one per byte. Every separate load of a lane-private
-// address is its own gather, so the count of loads matters more than their width.
-static __dpct_inline__ uint32_t moe_load_u32(const void * p) {
-    uint32_t v;
-    __builtin_memcpy(&v, p, sizeof(v));
-    return v;
-}
-static __dpct_inline__ uint64_t moe_load_u64(const void * p) {
-    uint64_t v;
-    __builtin_memcpy(&v, p, sizeof(v));
-    return v;
-}
-
 // fol[p * n_tokens + k]: for route p = token * n_ids + slot, the slot of token k whose dot product p computes, or -1.
 // The first token that names an expert computes it for every later token; those later routes get -1 everywhere.
 static void launch_moe_window_schedule(
@@ -2992,6 +2979,19 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
                 }
             });
     });
+}
+
+// Unaligned wide loads: one load per 4 or 8 bytes instead of one per byte. Every separate load of a lane-private
+// address is its own gather, so the count of loads matters more than their width.
+static __dpct_inline__ uint32_t moe_load_u32(const void * p) {
+    uint32_t v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return v;
+}
+static __dpct_inline__ uint64_t moe_load_u64(const void * p) {
+    uint64_t v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return v;
 }
 
 // Decoders of the 256-value superblock formats for the window kernel: one call decodes the 32 values of sub-block
