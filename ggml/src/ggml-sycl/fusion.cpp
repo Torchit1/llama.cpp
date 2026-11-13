@@ -355,6 +355,28 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         return true;
     }
 
+    // bf16 weights against a few f32 columns, then a scalar scale: the mat-vec kernel applies the scale
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_SCALE) {
+        const ggml_tensor * mm    = cgraph->nodes[node_idx];
+        const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * w     = mm->src[0];
+        const ggml_tensor * x     = mm->src[1];
+        if (scale->src[0] != mm || w->type != GGML_TYPE_BF16 || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+            scale->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(w) || !ggml_is_contiguous(x) || !ggml_is_contiguous(scale)) {
+            return false;
+        }
+        if (w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[1] < 1 || x->ne[1] > 8 ||
+            w->ne[0] % 64 != 0 || x->ne[0] != w->ne[0]) {
+            return false;
+        }
+        float bias;
+        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+        return bias == 0.0f;
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
         const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor * scale    = cgraph->nodes[node_idx + 1];

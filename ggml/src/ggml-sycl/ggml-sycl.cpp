@@ -6785,6 +6785,12 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// GGML_SYCL_FUSE_BF16_SCALE=0 turns the bf16 MUL_MAT + SCALE fusion off
+static bool ggml_sycl_fuse_bf16_mul_mat_scale() {
+    static const bool on = [] { const char * e = getenv("GGML_SYCL_FUSE_BF16_SCALE"); return e ? atoi(e) != 0 : true; }();
+    return on;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     sycl_ctx->gdn_gather = {};
     const auto gdn_gathers = ggml_sycl_match_gdn_state_gathers(cgraph);
@@ -6862,6 +6868,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         // qwen35 GDN l2 norms are emitted as rms_norm + scalar scale (models.h
         // build_gdn_l2_norm), which the rms_norm+mul fusion above cannot match
+        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_fuse_bf16_mul_mat_scale() &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_SCALE }, {}) &&
+            !ggml_backend_buffer_is_sycl_split(node->src[0]->buffer)) {
+            ggml_tensor * scale = cgraph->nodes[i + 1];
+            float         factor;
+            memcpy(&factor, (const float *) scale->op_params, sizeof(float));
+            if (ggml_sycl_mul_mat_bf16_ncols_esimd(node->src[0]->data, (const float *) node->src[1]->data,
+                                                   (float *) scale->data, (int) node->src[0]->ne[0], (int) node->src[0]->ne[1],
+                                                   (int) node->src[1]->ne[1], (size_t) node->src[1]->ne[0],
+                                                   (size_t) scale->ne[0], sycl_ctx->stream(), factor, /*min_cols=*/ 1)) {
+                i++;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
             ggml_sycl_op_rms_norm_scale_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
@@ -7312,6 +7332,17 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
     for (const auto & entry : ggml_sycl_match_gdn_state_gathers(cgraph)) {
         for (ggml_tensor * t : { entry.first->src[0], entry.first->src[1] }) {
             params->add_alloc_dep(params->user_data, t->view_src ? t->view_src : t, const_cast<ggml_tensor *>(entry.second));
+        }
+    }
+    if (ggml_sycl_fuse_bf16_mul_mat_scale()) {
+        for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
+            ggml_tensor * mm = cgraph->nodes[i];
+            if (mm->op != GGML_OP_MUL_MAT || !ggml_sycl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_SCALE }, {})) {
+                continue;
+            }
+            // the fused kernel writes the scale output while it reads the activations, which must not share memory
+            ggml_tensor * x = mm->src[1];
+            params->add_alloc_dep(params->user_data, x->view_src ? x->view_src : x, cgraph->nodes[i + 1]);
         }
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
