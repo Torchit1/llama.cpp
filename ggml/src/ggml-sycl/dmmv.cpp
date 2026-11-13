@@ -1996,7 +1996,119 @@ static void launch_mul_mat_vec_bf16_sycl_esimd(const void * vx, const float * y,
         default: mul_mat_vec_bf16_sycl_esimd<32>(vx, y, dst, ncols, nrows, stream); break;
     }
 }
+
+// The same kernel for NC activation columns (a step of a few tokens): a row's weights are read and widened once
+// and applied to every column.
+template <int WG, int NC>
+static void mul_mat_vec_bf16_sycl_esimd_ncols(const void * vx, const float * y, float * dst, const int ncols,
+                                              const int nrows, const size_t y_stride, const size_t dst_stride,
+                                              dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % 64 == 0);
+    const int nchunks = ncols / 64;
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG * NC), h);
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) nrows * WG), sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                using namespace sycl::ext::intel::esimd;
+                const int        tid = it.get_local_id(0);
+                const int        row = it.get_group(0);
+                const uint16_t * x   = (const uint16_t *) vx + (size_t) row * ncols;
+
+                simd<float, 32> acc[NC];
+#pragma unroll
+                for (int e = 0; e < NC; ++e) {
+                    acc[e] = 0.0f;
+                }
+                for (int c = tid; c < nchunks; c += WG) {
+                    const int          o  = c * 64;
+                    simd<uint32_t, 32> w0 = convert<uint32_t>(block_load<uint16_t, 32>(x + o)) << 16;
+                    simd<uint32_t, 32> w1 = convert<uint32_t>(block_load<uint16_t, 32>(x + o + 32)) << 16;
+                    const simd<float, 32> f0 = w0.template bit_cast_view<float>();
+                    const simd<float, 32> f1 = w1.template bit_cast_view<float>();
+#pragma unroll
+                    for (int e = 0; e < NC; ++e) {
+                        const float * ye = y + (size_t) e * y_stride + o;
+                        acc[e] += f0 * block_load<float, 32>(ye, element_aligned_tag{}) +
+                                  f1 * block_load<float, 32>(ye + 32, element_aligned_tag{});
+                    }
+                }
+                if (WG == 1) {
+#pragma unroll
+                    for (int e = 0; e < NC; ++e) {
+                        dst[(size_t) e * dst_stride + row] = reduce<float>(acc[e], std::plus<>{});
+                    }
+                    return;
+                }
+#pragma unroll
+                for (int e = 0; e < NC; ++e) {
+                    lmem[tid * NC + e] = reduce<float>(acc[e], std::plus<>{});
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                if (tid == 0) {
+#pragma unroll
+                    for (int e = 0; e < NC; ++e) {
+                        float sum = 0.0f;
+                        for (int p = 0; p < WG; ++p) {
+                            sum += lmem[p * NC + e];
+                        }
+                        dst[(size_t) e * dst_stride + row] = sum;
+                    }
+                }
+            });
+    });
+}
+
+template <int NC>
+static void launch_mul_mat_vec_bf16_sycl_esimd_ncols(const void * vx, const float * y, float * dst, const int ncols,
+                                                     const int nrows, const size_t y_stride, const size_t dst_stride,
+                                                     dpct::queue_ptr stream) {
+    const int nchunks = ncols / 64;
+    int wg = 1;
+    while (wg < 32 && wg * 2 <= nchunks && (int64_t) nrows * wg < 4096) {
+        wg *= 2;
+    }
+    switch (wg) {
+        case 1:  mul_mat_vec_bf16_sycl_esimd_ncols<1, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 2:  mul_mat_vec_bf16_sycl_esimd_ncols<2, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 4:  mul_mat_vec_bf16_sycl_esimd_ncols<4, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 8:  mul_mat_vec_bf16_sycl_esimd_ncols<8, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 16: mul_mat_vec_bf16_sycl_esimd_ncols<16, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        default: mul_mat_vec_bf16_sycl_esimd_ncols<32, NC>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+    }
+}
+
+// BF16 weights against 2..8 F32 activation columns. GGML_SYCL_BF16_ESIMD_NCOLS = widest batch taken (default 8,
+// 0 = off). Returns false when it does not take the call.
+bool ggml_sycl_mul_mat_bf16_ncols_esimd(const void * vx, const float * y, float * dst, int ncols, int nrows,
+                                        int n_cols_dst, size_t y_stride, size_t dst_stride, dpct::queue_ptr stream) {
+    static const int max_cols = [] { const char * e = getenv("GGML_SYCL_BF16_ESIMD_NCOLS"); return e ? atoi(e) : 8; }();
+    if (!g_ggml_sycl_enable_esimd || !ggml_sycl_bf16_esimd_enabled() || n_cols_dst < 2 || n_cols_dst > max_cols ||
+        n_cols_dst > 8 || ncols % 64 != 0) {
+        return false;
+    }
+    switch (n_cols_dst) {
+        case 2:  launch_mul_mat_vec_bf16_sycl_esimd_ncols<2>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 3:  launch_mul_mat_vec_bf16_sycl_esimd_ncols<3>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 4:  launch_mul_mat_vec_bf16_sycl_esimd_ncols<4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 5:  launch_mul_mat_vec_bf16_sycl_esimd_ncols<5>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 6:  launch_mul_mat_vec_bf16_sycl_esimd_ncols<6>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        case 7:  launch_mul_mat_vec_bf16_sycl_esimd_ncols<7>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+        default: launch_mul_mat_vec_bf16_sycl_esimd_ncols<8>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
+    }
+    return true;
+}
+#else // GGML_SYCL_DMMV_HAS_BF16
+bool ggml_sycl_mul_mat_bf16_ncols_esimd(const void *, const float *, float *, int, int, int, size_t, size_t, dpct::queue_ptr) {
+    return false;
+}
 #endif // GGML_SYCL_DMMV_HAS_BF16
+
+#else // GGML_SYCL_DMMV_HAS_ESIMD
+
+bool ggml_sycl_mul_mat_bf16_ncols_esimd(const void *, const float *, float *, int, int, int, size_t, size_t, dpct::queue_ptr) {
+    return false;
+}
 
 #endif // GGML_SYCL_DMMV_HAS_ESIMD
 

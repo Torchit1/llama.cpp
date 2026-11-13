@@ -3278,6 +3278,14 @@ inline void ggml_sycl_op_mul_mat_sycl(
     bool use_fp16 = false;
 #endif
 
+    // a few activation columns against bf16 weights: mat-vec kernel that reads each row once
+    if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
+        row_diff == src0->ne[1] && id == ctx.device &&
+        ggml_sycl_mul_mat_bf16_ncols_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, (int) ne00, (int) row_diff, (int) src1_ncols,
+                                           (size_t) ne10, (size_t) ldc, stream)) {
+        return;
+    }
+
 #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
     // Fast path for bf16 src0
     if (src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_dnn &&
