@@ -33,4 +33,9 @@ bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(
     const void * vx, const void * vgate, const float * y,
     float * dst, int ncols, int nrows, dpct::queue_ptr stream);
 
+// BF16 weights (row major, ncols per row) against 2..8 F32 activation columns, ESIMD. y_stride and dst_stride are
+// in floats. Returns false when the kernel is unavailable, switched off or the shape is not taken.
+bool ggml_sycl_mul_mat_bf16_ncols_esimd(const void * vx, const float * y, float * dst, int ncols, int nrows,
+                                        int n_cols_dst, size_t y_stride, size_t dst_stride, dpct::queue_ptr stream);
+
 #endif // GGML_SYCL_DMMV_HPP
