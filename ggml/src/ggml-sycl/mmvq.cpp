@@ -2929,10 +2929,10 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
                         const int            i   = t / dots_per_block;
                         const int            iqs = VDR_IQ4_NL_Q8_1_MMVQ * (t % dots_per_block);
                         const block_iq4_nl * bq  = &x[ibx0 + i];
+                        const uint16_t *     q4  = (const uint16_t *) bq->qs + 2 * iqs;
                         // decode once
-                        const uint64_t q4   = moe_load_u64(bq->qs + 4 * iqs);
-                        const uint32_t aux0 = (uint32_t) q4;
-                        const uint32_t aux1 = (uint32_t) (q4 >> 32);
+                        const uint32_t aux0 = q4[0] | (q4[1] << 16);
+                        const uint32_t aux1 = q4[2] | (q4[3] << 16);
                         const int v10 = (int) iq4nl_codes_to_int8(aux0 & 0x0f0f0f0f);
                         const int v20 = (int) iq4nl_codes_to_int8((aux0 >> 4) & 0x0f0f0f0f);
                         const int v11 = (int) iq4nl_codes_to_int8(aux1 & 0x0f0f0f0f);
@@ -2944,12 +2944,11 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
                             if (fk[k] >= 0) {
                                 const size_t       yrow = (size_t) k * y_rows_per_token + (y_rows_per_token == 1 ? 0 : fk[k]);
                                 const block_q8_1 * y    = (const block_q8_1 *) ((const char *) vy_base + yrow * y_row_bytes) + i;
-                                const uint64_t     qa   = moe_load_u64(y->qs + 4 * iqs);      // ints iqs, iqs + 1
-                                const uint64_t     qb   = moe_load_u64(y->qs + 4 * iqs + 16); // ints iqs + 4, iqs + 5
-                                int sumi = dpct::dp4a(v10, (int) (uint32_t) qa, 0);
-                                sumi     = dpct::dp4a(v20, (int) (uint32_t) qb, sumi);
-                                sumi     = dpct::dp4a(v11, (int) (uint32_t) (qa >> 32), sumi);
-                                sumi     = dpct::dp4a(v21, (int) (uint32_t) (qb >> 32), sumi);
+                                const int32_t *    q8   = (const int32_t *) y->qs + iqs;
+                                int sumi = dpct::dp4a(v10, q8[0], 0);
+                                sumi     = dpct::dp4a(v20, q8[4], sumi);
+                                sumi     = dpct::dp4a(v11, q8[1], sumi);
+                                sumi     = dpct::dp4a(v21, q8[5], sumi);
                                 tmp[k] += d * y->ds[0] * sumi;
                             }
                         }
@@ -2981,55 +2980,38 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
     });
 }
 
-// Unaligned wide loads: one load per 4 or 8 bytes instead of one per byte. Every separate load of a lane-private
-// address is its own gather, so the count of loads matters more than their width.
-static __dpct_inline__ uint32_t moe_load_u32(const void * p) {
-    uint32_t v;
-    __builtin_memcpy(&v, p, sizeof(v));
-    return v;
-}
-static __dpct_inline__ uint64_t moe_load_u64(const void * p) {
-    uint64_t v;
-    __builtin_memcpy(&v, p, sizeof(v));
-    return v;
-}
-
 // Decoders of the 256-value superblock formats for the window kernel: one call decodes the 32 values of sub-block
 // ib32 into eight packed int8 words, with one weight-side scale for words 0..3 and one for words 4..7.
 struct moe_window_iq2_s {
     using block_t = block_iq2_s;
     static __dpct_inline__ void decode(const block_t * bq2, const int ib32, int w[8], float & s1, float & s2) {
-        const uint32_t qs4    = moe_load_u32(bq2->qs + 4 * ib32);              // four grid indices (low 8 bits each)
-        const uint32_t signs4 = moe_load_u32(bq2->qs + QK_K / 8 + 4 * ib32);   // four sign bytes
-        const uint32_t qh     = bq2->qh[ib32];
-        const uint32_t sc     = bq2->scales[ib32];
+        const uint8_t * signs = bq2->qs + QK_K / 8 + 4 * ib32;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const uint32_t idx    = ((qs4 >> (8 * l)) & 0xff) | ((qh << (8 - 2 * l)) & 0x300);
-            const uint64_t grid   = iq2s_grid[idx];
-            const uint32_t sign   = (signs4 >> (8 * l)) & 0xff;
+            const uint32_t * grid = (const uint32_t *) (iq2s_grid + (bq2->qs[4 * ib32 + l] | ((bq2->qh[ib32] << (8 - 2 * l)) & 0x300)));
             const uint32_t signs0 = dpct::vectorized_binary<sycl::uchar4>(
-                ((sign & 0xf) * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
+                ((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
             const uint32_t signs1 = dpct::vectorized_binary<sycl::uchar4>(
-                ((sign >> 4) * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
-            w[2 * l + 0] = dpct::vectorized_binary<sycl::uchar4>((uint32_t) grid ^ signs0, signs0, std::minus<>());
-            w[2 * l + 1] = dpct::vectorized_binary<sycl::uchar4>((uint32_t) (grid >> 32) ^ signs1, signs1, std::minus<>());
+                ((signs[l] >> 4) * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
+            w[2 * l + 0] = dpct::vectorized_binary<sycl::uchar4>(grid[0] ^ signs0, signs0, std::minus<>());
+            w[2 * l + 1] = dpct::vectorized_binary<sycl::uchar4>(grid[1] ^ signs1, signs1, std::minus<>());
         }
         const float d = (float) bq2->d * 0.25f;
-        s1 = d * (0.5f + (sc & 0xf));
-        s2 = d * (0.5f + (sc >> 4));
+        s1 = d * (0.5f + (bq2->scales[ib32] & 0xf));
+        s2 = d * (0.5f + (bq2->scales[ib32] >> 4));
     }
 };
 
 struct moe_window_iq3_xxs {
     using block_t = block_iq3_xxs;
     static __dpct_inline__ void decode(const block_t * bq2, const int ib32, int w[8], float & s1, float & s2) {
-        const uint64_t q3    = moe_load_u64(bq2->qs + 8 * ib32);               // eight grid indices
-        uint32_t       aux32 = moe_load_u32(bq2->qs + QK_K / 4 + 4 * ib32);
+        const uint8_t *  q3  = bq2->qs + 8 * ib32;
+        const uint16_t * gas = (const uint16_t *) (bq2->qs + QK_K / 4) + 2 * ib32;
+        uint32_t aux32 = gas[0] | (gas[1] << 16);
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const uint32_t grid1     = iq3xxs_grid[(q3 >> (16 * l)) & 0xff];
-            const uint32_t grid2     = iq3xxs_grid[(q3 >> (16 * l + 8)) & 0xff];
+            const uint32_t grid1     = iq3xxs_grid[q3[2 * l + 0]];
+            const uint32_t grid2     = iq3xxs_grid[q3[2 * l + 1]];
             const uint32_t sign_bits = iq_sign_bits(aux32);
             const uint32_t signs0    = iq_sign_mask(sign_bits);
             const uint32_t signs1    = iq_sign_mask(sign_bits >> 4);
@@ -3045,14 +3027,12 @@ struct moe_window_iq3_xxs {
 struct moe_window_iq3_s {
     using block_t = block_iq3_s;
     static __dpct_inline__ void decode(const block_t * bq2, const int ib32, int w[8], float & s1, float & s2) {
-        const uint64_t qs     = moe_load_u64(bq2->qs + 8 * ib32);              // eight grid indices (low 8 bits each)
-        const uint32_t signs4 = moe_load_u32(bq2->signs + 4 * ib32);
-        const uint32_t qh     = bq2->qh[ib32];
+        const uint8_t * qs = bq2->qs + 8 * ib32;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const uint32_t grid1  = iq3s_grid[((qs >> (16 * l)) & 0xff) | ((qh << (8 - 2 * l)) & 256)];
-            const uint32_t grid2  = iq3s_grid[((qs >> (16 * l + 8)) & 0xff) | ((qh << (7 - 2 * l)) & 256)];
-            const uint32_t signs  = (signs4 >> (8 * l)) & 0xff;
+            const uint32_t grid1  = iq3s_grid[qs[2 * l + 0] | ((bq2->qh[ib32] << (8 - 2 * l)) & 256)];
+            const uint32_t grid2  = iq3s_grid[qs[2 * l + 1] | ((bq2->qh[ib32] << (7 - 2 * l)) & 256)];
+            const uint32_t signs  = bq2->signs[4 * ib32 + l];
             const uint32_t signs0 = iq_sign_mask(signs);
             const uint32_t signs1 = iq_sign_mask(signs >> 4);
             w[2 * l + 0] = (grid1 ^ signs0) + (signs0 & 0x01010101);
@@ -3116,18 +3096,15 @@ static void launch_mul_mat_vec_grid_moe_window(
                             if (fk[k] >= 0) {
                                 const size_t       yrow = (size_t) k * y_rows_per_token + (y_rows_per_token == 1 ? 0 : fk[k]);
                                 const block_q8_1 * y    = (const block_q8_1 *) ((const char *) vy_base + yrow * y_row_bytes) + t;
-                                const uint64_t     q0   = moe_load_u64(y->qs + 0);
-                                const uint64_t     q1   = moe_load_u64(y->qs + 8);
-                                const uint64_t     q2   = moe_load_u64(y->qs + 16);
-                                const uint64_t     q3   = moe_load_u64(y->qs + 24);
-                                int sum1 = dpct::dp4a(w[0], (int) (uint32_t) q0, 0);
-                                sum1     = dpct::dp4a(w[1], (int) (uint32_t) (q0 >> 32), sum1);
-                                sum1     = dpct::dp4a(w[2], (int) (uint32_t) q1, sum1);
-                                sum1     = dpct::dp4a(w[3], (int) (uint32_t) (q1 >> 32), sum1);
-                                int sum2 = dpct::dp4a(w[4], (int) (uint32_t) q2, 0);
-                                sum2     = dpct::dp4a(w[5], (int) (uint32_t) (q2 >> 32), sum2);
-                                sum2     = dpct::dp4a(w[6], (int) (uint32_t) q3, sum2);
-                                sum2     = dpct::dp4a(w[7], (int) (uint32_t) (q3 >> 32), sum2);
+                                const int *        q8   = (const int *) y->qs;
+                                int sum1 = dpct::dp4a(w[0], q8[0], 0);
+                                sum1     = dpct::dp4a(w[1], q8[1], sum1);
+                                sum1     = dpct::dp4a(w[2], q8[2], sum1);
+                                sum1     = dpct::dp4a(w[3], q8[3], sum1);
+                                int sum2 = dpct::dp4a(w[4], q8[4], 0);
+                                sum2     = dpct::dp4a(w[5], q8[5], sum2);
+                                sum2     = dpct::dp4a(w[6], q8[6], sum2);
+                                sum2     = dpct::dp4a(w[7], q8[7], sum2);
                                 tmp[k] += y->ds[0] * (s1 * sum1 + s2 * sum2);
                             }
                         }
