@@ -13500,6 +13500,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // qwen3.8-flash-next coder: 256 experts, 10 used, gate/up 2560 -> 640, down 640 -> 2560
+    for (int bs : {1, 2, 4}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 10, false, 640, bs, 2560));
+        }
+        for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 10, false, 2560, bs, 640));
+        }
+    }
+
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
