@@ -2980,6 +2980,18 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
     });
 }
 
+// 0xFF in every byte of x that is non-zero
+static __dpct_inline__ uint32_t moe_swar_ne4(uint32_t x) {
+    x = (x | (x >> 4)) & 0x0F0F0F0Fu;
+    x = (x | (x >> 2)) & 0x03030303u;
+    x = (x | (x >> 1)) & 0x01010101u;
+    return x * 0xFFu;
+}
+// per byte a - s for s bytes that are 0x00 or 0xFF (a + 1 where the byte of s is set), no carry between bytes
+static __dpct_inline__ int moe_swar_sub4(uint32_t a, uint32_t s) {
+    return (int) (((a & 0x7F7F7F7Fu) + (s & 0x01010101u)) ^ (a & 0x80808080u));
+}
+
 // Decoders of the 256-value superblock formats for the window kernel: one call decodes the 32 values of sub-block
 // ib32 into eight packed int8 words, with one weight-side scale for words 0..3 and one for words 4..7.
 struct moe_window_iq2_s {
@@ -2989,12 +3001,12 @@ struct moe_window_iq2_s {
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const uint32_t * grid = (const uint32_t *) (iq2s_grid + (bq2->qs[4 * ib32 + l] | ((bq2->qh[ib32] << (8 - 2 * l)) & 0x300)));
-            const uint32_t signs0 = dpct::vectorized_binary<sycl::uchar4>(
-                ((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
-            const uint32_t signs1 = dpct::vectorized_binary<sycl::uchar4>(
-                ((signs[l] >> 4) * 0x01010101) & 0x08040201, 0x08040201, std::equal_to<>());
-            w[2 * l + 0] = dpct::vectorized_binary<sycl::uchar4>(grid[0] ^ signs0, signs0, std::minus<>());
-            w[2 * l + 1] = dpct::vectorized_binary<sycl::uchar4>(grid[1] ^ signs1, signs1, std::minus<>());
+            // one sign bit per byte -> 0xFF in that byte, then the two's complement per byte, both without the
+            // per-byte loops that dpct::vectorized_binary<sycl::uchar4> expands to
+            const uint32_t signs0 = moe_swar_ne4(((signs[l] & 0xf) * 0x01010101) & 0x08040201);
+            const uint32_t signs1 = moe_swar_ne4(((signs[l] >> 4) * 0x01010101) & 0x08040201);
+            w[2 * l + 0] = moe_swar_sub4(grid[0] ^ signs0, signs0);
+            w[2 * l + 1] = moe_swar_sub4(grid[1] ^ signs1, signs1);
         }
         const float d = (float) bq2->d * 0.25f;
         s1 = d * (0.5f + (bq2->scales[ib32] & 0xf));
