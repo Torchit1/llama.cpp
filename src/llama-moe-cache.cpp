@@ -415,6 +415,61 @@ struct llama_moe_cache::impl {
     size_t                  stage_bytes = 0; // read from the file so far
     size_t                  stage_reads = 0;
 
+    // RAM tier by usage (LLAMA_MOE_RAM_CACHE_MIB=N): the file-backed experts used most recently are kept in pinned
+    // memory, one slot per (layer, expert) holding all its tensors. A device-cache miss is uploaded from its RAM slot;
+    // an expert that is in neither is read from the file into the least recently used slot first.
+    struct ram_tier {
+        bool                                 ready      = false;
+        size_t                               slot_bytes = 0;
+        std::vector<size_t>                  t_off;      // offset of each expert tensor inside a slot
+        int32_t                              n_slots    = 0;
+        ggml_backend_buffer_ptr              buf;
+        uint8_t *                            base       = nullptr;
+        std::unordered_map<int64_t, int32_t> slot_of;
+        std::vector<int64_t>                 key_of;
+        std::vector<uint64_t>                stamp;
+        uint64_t                             tick       = 0;
+        int32_t                              hand       = 0;
+    };
+    std::vector<ram_tier> ram;       // per group
+    size_t                ram_hits  = 0;
+    size_t                ram_reads = 0;
+
+    ram_tier & ram_of(ggml_backend_t backend, size_t ig) {
+        if (ram.size() < groups.size()) {
+            ram.resize(groups.size());
+        }
+        ram_tier & r = ram[ig];
+        if (!r.ready) {
+            r.ready = true;
+            static const long long mib = getenv("LLAMA_MOE_RAM_CACHE_MIB") ? atoll(getenv("LLAMA_MOE_RAM_CACHE_MIB")) : 0;
+            size_t host_total = 0;
+            for (const group & gg : groups) {
+                host_total += gg.host_bytes;
+            }
+            const group & g = groups[ig];
+            for (const ggml_tensor * t : g.ref) {
+                r.t_off.push_back(r.slot_bytes);
+                r.slot_bytes += t->nb[2];
+            }
+            const size_t budget = host_total > 0 ? (size_t) ((double) mib*1024*1024*g.host_bytes/host_total) : 0;
+            r.n_slots = r.slot_bytes > 0 ? (int32_t) (budget/r.slot_bytes) : 0;
+            if (r.n_slots >= 8*n_expert_used) {
+                ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+                r.buf.reset(ggml_backend_buft_alloc_buffer(host ? host : ggml_backend_cpu_buffer_type(), (size_t) r.n_slots*r.slot_bytes));
+            }
+            if (r.buf) {
+                r.base = (uint8_t *) ggml_backend_buffer_get_base(r.buf.get());
+                r.key_of.assign(r.n_slots, -1);
+                r.stamp.assign(r.n_slots, 0);
+                LLAMA_LOG_INFO("llama_moe_cache: RAM tier of group %zu: %d experts, %.2f MiB pinned\n", ig, r.n_slots, r.n_slots*r.slot_bytes/1024.0/1024.0);
+            } else {
+                r.n_slots = 0;
+            }
+        }
+        return r;
+    }
+
     uint8_t * stage_reserve(ggml_backend_t backend, size_t size) {
         if (size > stage_size) {
             ggml_backend_synchronize(backend); // copies out of the old buffer may still be queued
@@ -854,36 +909,84 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // disk tier: read the missing experts of file-backed tensors into the pinned staging buffer, in parallel
-        struct stage_job { const uint8_t * src; uint8_t * dst; size_t size; };
-        std::vector<stage_job> jobs;
-        std::vector<const uint8_t *> staged(l.experts.size(), nullptr); // per tensor: start of its staged experts, in fills order
+        // Where each missing expert of each tensor is uploaded from: the host tensor itself (pinned experts), a slot of
+        // the RAM tier, or the staging buffer. File-backed experts are read by helper threads, one request per expert.
+        struct read_job { const uint8_t * src; uint8_t * dst; size_t size; };
+        std::vector<read_job> jobs;
+        std::vector<std::vector<const uint8_t *>> srcs(l.experts.size());
         {
-            size_t need = 0;
+            std::vector<size_t> file_ips;
             for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-                if (!fills.empty() && llama_moe_cache_is_file_backed(l.experts[ip])) {
-                    need += fills.size()*l.experts[ip]->nb[2];
+                const ggml_tensor * w = l.experts[ip];
+                srcs[ip].resize(fills.size());
+                for (size_t i = 0; i < fills.size(); ++i) {
+                    srcs[ip][i] = (const uint8_t *) w->data + fills[i].expert*w->nb[2];
+                }
+                if (!fills.empty() && llama_moe_cache_is_file_backed(w)) {
+                    file_ips.push_back(ip);
                 }
             }
-            uint8_t * base = need > 0 ? stage_reserve(backend, need) : nullptr;
-            size_t offs = 0;
-            for (size_t ip = 0; base != nullptr && ip < l.experts.size(); ++ip) {
-                const ggml_tensor * w = l.experts[ip];
-                if (!llama_moe_cache_is_file_backed(w)) {
-                    continue;
+            if (!file_ips.empty()) {
+                ram_tier & r = ram_of(backend, l.ig);
+                const bool use_ram = r.n_slots > 0 && fills.size() <= (size_t) r.n_slots/2;
+                uint8_t * stage = nullptr;
+                size_t    stage_offs = 0;
+                if (!use_ram) {
+                    size_t need = 0;
+                    for (size_t ip : file_ips) {
+                        need += fills.size()*l.experts[ip]->nb[2];
+                    }
+                    stage = stage_reserve(backend, need);
                 }
-                const size_t expert_size = w->nb[2];
-                staged[ip] = base + offs;
+                const uint64_t call_tick = ++r.tick;
                 for (size_t i = 0; i < fills.size(); ++i) {
-                    const uint8_t * src = (const uint8_t *) w->data + fills[i].expert*expert_size;
+                    uint8_t * slot_base = nullptr;
+                    bool      read      = true;
+                    if (use_ram) {
+                        const int64_t key = ((int64_t) il << 20) | fills[i].expert;
+                        auto it = r.slot_of.find(key);
+                        int32_t s;
+                        if (it != r.slot_of.end()) {
+                            s    = it->second;
+                            read = false;
+                            ram_hits++;
+                        } else {
+                            // least recently used of the next 64 slots that this call does not use
+                            s = -1;
+                            for (int k = 0; k < 64; ++k) {
+                                const int32_t cand = (r.hand + k) % r.n_slots;
+                                if (r.stamp[cand] != call_tick && (s < 0 || r.stamp[cand] < r.stamp[s])) {
+                                    s = cand;
+                                }
+                            }
+                            r.hand = (r.hand + 64) % r.n_slots;
+                            if (r.key_of[s] >= 0) {
+                                r.slot_of.erase(r.key_of[s]);
+                            }
+                            r.key_of[s]    = key;
+                            r.slot_of[key] = s;
+                        }
+                        r.stamp[s] = call_tick;
+                        slot_base  = r.base + (size_t) s*r.slot_bytes;
+                    }
+                    for (size_t ip : file_ips) {
+                        const ggml_tensor * w = l.experts[ip];
+                        const size_t expert_size = w->nb[2];
+                        uint8_t * dst = use_ram ? slot_base + r.t_off[ip] : (stage ? stage + stage_offs : nullptr);
+                        if (dst == nullptr) {
+                            continue; // no pinned memory: upload from the file mapping as before
+                        }
+                        if (read) {
+                            const uint8_t * src = srcs[ip][i];
 #if defined(__linux__)
-                    // start the reads of the whole expert now: one request per expert, not one per page
-                    const size_t page = 4096;
-                    const uintptr_t beg = (uintptr_t) src & ~(page - 1);
-                    madvise((void *) beg, (uintptr_t) src + expert_size - beg, MADV_WILLNEED);
+                            const uintptr_t beg = (uintptr_t) src & ~(uintptr_t) 4095;
+                            madvise((void *) beg, (uintptr_t) src + expert_size - beg, MADV_WILLNEED);
 #endif
-                    jobs.push_back({ src, base + offs, expert_size });
-                    offs += expert_size;
+                            jobs.push_back({ src, dst, expert_size });
+                        }
+                        srcs[ip][i] = dst;
+                        stage_offs += use_ram ? 0 : expert_size;
+                    }
                 }
             }
             if (!jobs.empty()) {
@@ -902,12 +1005,15 @@ struct llama_moe_cache::impl {
                 for (auto & t : thr) {
                     t.join();
                 }
-                stage_bytes += offs;
+                for (const read_job & j : jobs) {
+                    stage_bytes += j.size;
+                }
                 stage_reads += jobs.size();
+                ram_reads   += jobs.size();
             }
         }
 
-        // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+        // upload the missing experts, consecutive experts going to consecutive slots from consecutive memory are uploaded together
         size_t bytes = 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
@@ -915,12 +1021,11 @@ struct llama_moe_cache::impl {
             const size_t expert_size = w->nb[2];
             for (size_t i = 0; i < fills.size();) {
                 size_t n = 1;
-                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n &&
+                       srcs[ip][i + n] == srcs[ip][i] + n*expert_size) {
                     n++;
                 }
-                // staged experts sit in fills order, so a run of consecutive fills is contiguous there too
-                const uint8_t * src = staged[ip] != nullptr ? staged[ip] + i*expert_size : (const uint8_t *) w->data + fills[i].expert*expert_size;
-                ggml_backend_tensor_set_async(backend, bank, src, fills[i].slot*expert_size, n*expert_size);
+                ggml_backend_tensor_set_async(backend, bank, srcs[ip][i], fills[i].slot*expert_size, n*expert_size);
                 bytes += n*expert_size;
                 i += n;
             }
@@ -940,7 +1045,7 @@ struct llama_moe_cache::impl {
 
     void log_stats() const {
         if (stage_reads > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: disk tier: %zu experts read from the file, %.2f MiB\n", stage_reads, stage_bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("llama_moe_cache: disk tier: %zu expert tensors read from the file, %.2f MiB; RAM tier: %zu hits\n", stage_reads, stage_bytes/1024.0/1024.0, ram_hits);
         }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
