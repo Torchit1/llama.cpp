@@ -495,6 +495,7 @@ struct llama_moe_cache::impl {
         std::unordered_map<int64_t, int32_t> slot_of;
         std::vector<int64_t>                 key_of;
         std::vector<uint64_t>                stamp;
+        std::vector<uint8_t>                 ref;        // CLOCK reference count, 0..3: bumped on a hit, aged by the hand
         uint64_t                             tick       = 0;
         int32_t                              hand       = 0;
     };
@@ -531,6 +532,7 @@ struct llama_moe_cache::impl {
                 r.base = (uint8_t *) ggml_backend_buffer_get_base(r.buf.get());
                 r.key_of.assign(r.n_slots, -1);
                 r.stamp.assign(r.n_slots, 0);
+                r.ref.assign(r.n_slots, 0);
                 ggml_init_params params = { g.ref.size()*ggml_tensor_overhead(), nullptr, true };
                 r.ctx.reset(ggml_init(params));
                 size_t off = 0;
@@ -572,22 +574,32 @@ struct llama_moe_cache::impl {
             s    = it->second;
             read = false;
             ram_hits++;
+            if (r.ref[s] < 3) {
+                r.ref[s]++;
+            }
         } else {
-            // least recently used of the next 64 slots that this call does not use; keep going if all 64 are in use by it
+            // CLOCK: the hand ages the slots it passes and takes the first one with no references left that this call
+            // does not use, so experts that keep being hit survive several passes and one-off experts go first
             s = -1;
-            for (int32_t k = 0; k < r.n_slots && (k < 64 || s < 0); ++k) {
-                const int32_t cand = (r.hand + k) % r.n_slots;
-                if (r.stamp[cand] != call_tick && (s < 0 || r.stamp[cand] < r.stamp[s])) {
+            for (int64_t k = 0; k < 5*(int64_t) r.n_slots && s < 0; ++k) {
+                const int32_t cand = r.hand;
+                r.hand = (r.hand + 1) % r.n_slots;
+                if (r.stamp[cand] == call_tick) {
+                    continue;
+                }
+                if (r.ref[cand] > 0) {
+                    r.ref[cand]--;
+                } else {
                     s = cand;
                 }
             }
             GGML_ASSERT(s >= 0 && "the RAM tier is smaller than the experts of one call");
-            r.hand = (r.hand + 64) % r.n_slots;
             if (r.key_of[s] >= 0) {
                 r.slot_of.erase(r.key_of[s]);
             }
             r.key_of[s]    = key;
             r.slot_of[key] = s;
+            r.ref[s]       = 0;
             read = true;
         }
         r.stamp[s] = call_tick;
