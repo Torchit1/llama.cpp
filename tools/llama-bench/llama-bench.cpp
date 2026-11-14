@@ -2169,6 +2169,8 @@ struct ctx_state {
 };
 
 static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
+    // local: LLAMA_BENCH_FIXED_TOKENS=1 draws the same tokens every repeat, so repeats do identical work
+    if (getenv("LLAMA_BENCH_FIXED_TOKENS")) { std::srand(1234); }
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
@@ -2199,6 +2201,8 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
 }
 
 static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
+    // local: LLAMA_BENCH_FIXED_TOKENS=1 draws the same tokens every repeat, so repeats do identical work
+    if (getenv("LLAMA_BENCH_FIXED_TOKENS")) { std::srand(1234); }
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);

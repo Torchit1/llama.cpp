@@ -538,6 +538,27 @@ static bool ggml_sycl_check_fusion_memory_ranges(const ggml_cgraph * cgraph, con
     return is_ok;
 }
 
+// Tensors the fused router kernel reads (logits) and writes (ids, weights) for the pattern starting at node i,
+// so that graph_optimize can keep the logits allocated until both outputs are placed. False if no pattern starts here.
+bool ggml_sycl_topk_moe_io(const ggml_cgraph * cgraph, int i, ggml_tensor ** logits, ggml_tensor ** ids, ggml_tensor ** weights) {
+    ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_UNARY && node->op != GGML_OP_SOFT_MAX) {
+        return false;
+    }
+    ggml_sycl_topk_moe_args args;
+    if (!ggml_sycl_topk_moe_fusion(cgraph, i, args) || args.prob_bias || args.delayed_softmax) {
+        return false;
+    }
+    const int n_ops = 5 + (args.norm ? 5 : 0) + (args.scale ? 1 : 0);
+    if (i + n_ops > cgraph->n_nodes) {
+        return false;
+    }
+    *logits  = node->src[0];
+    *ids     = cgraph->nodes[i + 3];
+    *weights = cgraph->nodes[i + n_ops - 1];
+    return true;
+}
+
 int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
     if (!g_ggml_sycl_enable_fusion) {
         return 0;
@@ -555,6 +576,8 @@ int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
 
     ggml_sycl_topk_moe_args args;
     if (!ggml_sycl_topk_moe_fusion(cgraph, i, args)) {
+        static int dbg0 = getenv("GGML_SYCL_TOPK_DEBUG") ? 4 : 0;
+        if (dbg0 > 0 && node->op == GGML_OP_SOFT_MAX) { dbg0--; fprintf(stderr, "TOPKDBG node %d: pattern not matched\n", i); }
         return 0;
     }
 
@@ -590,6 +613,15 @@ int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
         weights      = cgraph->nodes[i + (int) ops.size() - 1];
         out_nodes[1] = i + (int) ops.size() - 1;
 
+        {   // local probe: GGML_SYCL_TOPK_DEBUG=1 prints why the router fusion is taken or declined (first 4 times)
+            static int dbg = getenv("GGML_SYCL_TOPK_DEBUG") ? 4 : 0;
+            if (dbg > 0) {
+                dbg--;
+                fprintf(stderr, "TOPKDBG node %d norm=%d scale=%d nops=%d subgraph=%d should=%d ranges=%d\n", i, (int) args.norm, (int) args.scale, (int) ops.size(),
+                        (int) ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2), (int) ggml_sycl_should_use_topk_moe(node, weights, logits, ids),
+                        (int) ggml_sycl_check_fusion_memory_ranges(cgraph, i, (int) ops.size(), out_nodes, 2, true));
+            }
+        }
         if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
             ggml_sycl_should_use_topk_moe(node, weights, logits, ids) &&
             ggml_sycl_check_fusion_memory_ranges(cgraph, i, (int) ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {

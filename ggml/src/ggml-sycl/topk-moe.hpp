@@ -8,5 +8,6 @@
 int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i);
 
 int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i);
+bool ggml_sycl_topk_moe_io(const ggml_cgraph * cgraph, int i, ggml_tensor ** logits, ggml_tensor ** ids, ggml_tensor ** weights);
 
 #endif  // GGML_SYCL_TOPK_MOE_HPP

@@ -6791,12 +6791,117 @@ static bool ggml_sycl_fuse_bf16_mul_mat_scale() {
     return on;
 }
 
+// Weighted sum of the routed experts: MUL(experts [n, E, T], weights [1, E, T]) -> E views -> chain of E-1 ADDs.
+// One kernel replaces the multiply and the adds. GGML_SYCL_FUSE_MOE_SUM=0 turns it off.
+struct ggml_sycl_moe_sum_match {
+    ggml_tensor * mul = nullptr;
+    ggml_tensor * out = nullptr;
+    int           last_idx = 0;
+};
+
+static bool ggml_sycl_fuse_moe_sum() {
+    static const bool on = getenv("GGML_SYCL_FUSE_MOE_SUM") == nullptr || atoi(getenv("GGML_SYCL_FUSE_MOE_SUM")) != 0;
+    return on;
+}
+
+static bool ggml_sycl_match_moe_sum(const ggml_cgraph * cgraph, int i, ggml_sycl_moe_sum_match & m) {
+    ggml_tensor * mul = cgraph->nodes[i];
+    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || mul->ne[3] != 1 || mul->ne[1] < 2) {
+        return false;
+    }
+    const int           E = (int) mul->ne[1];
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * w = mul->src[1];
+    {   // local probe: GGML_SYCL_MOE_SUM_DEBUG=1 prints the candidate's shape facts (first 3)
+        static int dbg = getenv("GGML_SYCL_MOE_SUM_DEBUG") ? 3 : 0;
+        if (dbg > 0 && E == 10 && i + 2 * E - 1 < cgraph->n_nodes) {
+            dbg--;
+            const ggml_tensor * v = cgraph->nodes[i + 2];
+            const ggml_tensor * ad = cgraph->nodes[i + 1 + E];
+            fprintf(stderr, "MOESUM node %d x[%lld %lld %lld] w[%lld %lld %lld %lld] uses=%d contig x%d w%d m%d | v1 op=%s view_src_is_mul=%d offs=%zu nb1=%zu (mul nb1=%zu nb2=%zu) ne[%lld %lld %lld] uses=%d | add op=%s s0=%d s1=%d\n",
+                    i, (long long) x->ne[0], (long long) x->ne[1], (long long) x->ne[2], (long long) w->ne[0], (long long) w->ne[1], (long long) w->ne[2], (long long) w->ne[3],
+                    (int) ggml_node_get_use_count(cgraph, i), (int) ggml_is_contiguous(x), (int) ggml_is_contiguous(w), (int) ggml_is_contiguous(mul),
+                    ggml_op_name(v->op), (int) (v->view_src == mul), v->view_offs, v->nb[1], mul->nb[1], mul->nb[2], (long long) v->ne[0], (long long) v->ne[1], (long long) v->ne[2],
+                    (int) ggml_node_get_use_count(cgraph, i + 2), ggml_op_name(ad->op), (int) (ad->src[0] == cgraph->nodes[i + 1]), (int) (ad->src[1] == cgraph->nodes[i + 2]));
+        }
+    }
+    if (i + 2 * E - 1 >= cgraph->n_nodes || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || !ggml_are_same_shape(x, mul) ||
+        w->ne[0] != 1 || w->ne[1] != E || w->ne[2] != mul->ne[2] || w->ne[3] != 1 || !ggml_is_contiguous(x) || !ggml_is_contiguous(w) ||
+        !ggml_is_contiguous(mul) || !ggml_node_has_n_uses(cgraph, i, E)) {
+        return false;
+    }
+    for (int e = 0; e < E; e++) {
+        const ggml_tensor * v = cgraph->nodes[i + 1 + e];
+        if (v->op != GGML_OP_VIEW || v->view_src != mul || v->view_offs != (size_t) e * mul->nb[1] || v->ne[0] != mul->ne[0] ||
+            v->ne[1] != mul->ne[2] || v->ne[2] != 1 || v->nb[1] != mul->nb[2] || ggml_node_get_use_count(cgraph, i + 1 + e) != 1) {
+            return false;
+        }
+    }
+    for (int k = 0; k < E - 1; k++) {
+        const int           idx  = i + 1 + E + k;
+        const ggml_tensor * add  = cgraph->nodes[idx];
+        const ggml_tensor * prev = k == 0 ? cgraph->nodes[i + 1] : cgraph->nodes[idx - 1];
+        const ggml_tensor * view = cgraph->nodes[i + 2 + k];
+        if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || add->ne[0] != mul->ne[0] || add->ne[1] != mul->ne[2] ||
+            !((add->src[0] == prev && add->src[1] == view) || (add->src[0] == view && add->src[1] == prev)) ||
+            (k < E - 2 && !ggml_node_has_n_uses(cgraph, idx, 1))) {
+            return false;
+        }
+    }
+    m.mul      = mul;
+    m.last_idx = i + 2 * E - 1;
+    m.out      = cgraph->nodes[m.last_idx];
+    return ggml_is_contiguous(m.out);
+}
+
+static void ggml_sycl_op_moe_sum(ggml_backend_sycl_context & ctx, const ggml_sycl_moe_sum_match & m) {
+    const float * x   = (const float *) m.mul->src[0]->data;
+    const float * w   = (const float *) m.mul->src[1]->data;
+    float *       out = (float *) m.out->data;
+    const size_t  n   = (size_t) m.mul->ne[0];
+    const int     E   = (int) m.mul->ne[1];
+    const size_t  T   = (size_t) m.mul->ne[2];
+    ctx.stream()->parallel_for(sycl::range<1>(n * T), [=](sycl::id<1> id) {
+        const size_t  t  = id[0] / n;
+        const size_t  j  = id[0] - t * n;
+        const float * xt = x + t * (size_t) E * n + j;
+        const float * wt = w + t * (size_t) E;
+        float         acc = xt[0] * wt[0];
+        for (int e = 1; e < E; e++) {
+            acc += xt[(size_t) e * n] * wt[e];
+        }
+        out[id[0]] = acc;
+    });
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     sycl_ctx->gdn_gather = {};
     const auto gdn_gathers = ggml_sycl_match_gdn_state_gathers(cgraph);
     ggml_sycl_conv_window_match conv_window;
+    static const bool hopt = getenv("GGML_SYCL_HOST_OPTIME") != nullptr; // local host-time probe (time between node starts, by op)
+    static int64_t hacc[GGML_OP_COUNT]; static int64_t hcnt[GGML_OP_COUNT]; static int hgraphs = 0;
+    static int64_t hpre = 0, hpre_n = 0; // time from node start to the plain compute_forward call (fusion checks)
+    int64_t ht = 0; int hop = -1;
+    {   // local probe: GGML_SYCL_DUMP_GRAPH=1 prints the node list of the first large graph once
+        static bool dumped = getenv("GGML_SYCL_DUMP_GRAPH") == nullptr;
+        if (!dumped && cgraph->n_nodes > 1000) {
+            dumped = true;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                const ggml_tensor * n = cgraph->nodes[i];
+                fprintf(stderr, "GNODE %d %s%s %s [%lld %lld %lld %lld] %s src0=%s src1=%s\n", i, ggml_op_name(n->op),
+                        n->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(n)) : "", ggml_type_name(n->type),
+                        (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3], n->name,
+                        n->src[0] ? ggml_type_name(n->src[0]->type) : "-", n->src[1] ? ggml_type_name(n->src[1]->type) : "-");
+            }
+        }
+    }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (hopt) {
+            const int64_t now = ggml_time_us();
+            if (hop >= 0) { hacc[hop] += now - ht; hcnt[hop]++; }
+            ht = now; hop = (int) node->op;
+        }
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }
@@ -6825,6 +6930,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 
+        if (node->op == GGML_OP_MUL && ggml_sycl_fuse_moe_sum()) {
+            ggml_sycl_moe_sum_match moe_sum;
+            if (ggml_sycl_match_moe_sum(cgraph, i, moe_sum)) {
+                ggml_sycl_op_moe_sum(*sycl_ctx, moe_sum);
+                i = moe_sum.last_idx;
+                continue;
+            }
+        }
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
             i += nodes_to_skip;
@@ -6941,11 +7054,25 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        if (hopt) { hpre += ggml_time_us() - ht; hpre_n++; }
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+    if (hopt) { // local host-time probe: print the per-op table every 300 large graphs
+        const int64_t now = ggml_time_us();
+        if (hop >= 0) { hacc[hop] += now - ht; hcnt[hop]++; }
+        if (cgraph->n_nodes > 1000 && ++hgraphs == 300) {
+            int64_t tot = 0; for (int o = 0; o < GGML_OP_COUNT; o++) { tot += hacc[o]; }
+            fprintf(stderr, "HOSTOP total %.2f ms per graph\n", tot / 1000.0 / hgraphs);
+            fprintf(stderr, "HOSTOP pre-dispatch %.3f ms per graph over %.0f nodes\n", hpre / 1000.0 / hgraphs, (double) hpre_n / hgraphs); hpre = 0; hpre_n = 0;
+            for (int o = 0; o < GGML_OP_COUNT; o++) {
+                if (hcnt[o]) { fprintf(stderr, "HOSTOP %-18s %7.1f nodes %7.3f ms %6.2f us\n", ggml_op_name((ggml_op) o), (double) hcnt[o] / hgraphs, hacc[o] / 1000.0 / hgraphs, (double) hacc[o] / hcnt[o]); }
+            }
+            hgraphs = 0; for (int o = 0; o < GGML_OP_COUNT; o++) { hacc[o] = 0; hcnt[o] = 0; }
+        }
     }
 }
 
@@ -7343,6 +7470,29 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
             // the fused kernel writes the scale output while it reads the activations, which must not share memory
             ggml_tensor * x = mm->src[1];
             params->add_alloc_dep(params->user_data, x->view_src ? x->view_src : x, cgraph->nodes[i + 1]);
+        }
+    }
+    if (ggml_sycl_fuse_moe_sum()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_sycl_moe_sum_match m;
+            if (cgraph->nodes[i]->op != GGML_OP_MUL || !ggml_sycl_match_moe_sum(cgraph, i, m)) {
+                continue;
+            }
+            // the fused kernel reads the expert outputs and the weights while it writes the sum
+            for (ggml_tensor * t : { m.mul->src[0], m.mul->src[1] }) {
+                params->add_alloc_dep(params->user_data, t->view_src ? t->view_src : t, m.out);
+            }
+            i = m.last_idx;
+        }
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        // the fused router kernel reads the logits while it writes the ids and weights, which must not share memory
+        ggml_tensor * logits = nullptr, * ids = nullptr, * weights = nullptr;
+        if (!ggml_sycl_topk_moe_io(cgraph, i, &logits, &ids, &weights)) {
+            continue;
+        }
+        for (ggml_tensor * out : { ids, weights }) {
+            params->add_alloc_dep(params->user_data, logits->view_src ? logits->view_src : logits, out->view_src ? out->view_src : out);
         }
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {

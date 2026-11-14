@@ -958,7 +958,12 @@ void llama_context::synchronize() {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    {
+        static const bool trace = getenv("LLAMA_DECODE_TRACE") != nullptr;
+        const int64_t t0 = trace ? ggml_time_us() : 0;
+        ggml_backend_sched_synchronize(sched.get());
+        if (trace) { fprintf(stderr, "DS %p 0 %lld %lld\n", (const void *) this, (long long) t0, (long long) ggml_time_us()); }
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1830,6 +1835,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    static const bool dtrace = getenv("LLAMA_DECODE_TRACE") != nullptr; // local timing probe
+    const int64_t dt0 = dtrace ? ggml_time_us() : 0;
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1876,6 +1883,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    const int64_t dt1 = dtrace ? ggml_time_us() : 0;
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1886,7 +1894,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t dt2 = dtrace ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (dtrace) {
+        const long long dt3 = ggml_time_us();
+        fprintf(stderr, "DB %p %d %lld %lld\nDI %p %d %lld %lld\nDC %p %d %lld %lld\n", (const void *) this, (int) ubatch.n_tokens, (long long) dt0, (long long) dt1,
+                (const void *) this, (int) ubatch.n_tokens, (long long) dt1, (long long) dt2, (const void *) this, (int) ubatch.n_tokens, (long long) dt2, dt3);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2146,7 +2160,18 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// local timing probe: LLAMA_DECODE_TRACE=1 prints one line per decode (context, tokens, start and end in us)
+struct llama_decode_trace {
+    const void * ctx; size_t n; int64_t t0; bool on;
+    llama_decode_trace(const void * c, size_t n_) : ctx(c), n(n_) {
+        static const bool e = getenv("LLAMA_DECODE_TRACE") != nullptr;
+        on = e; t0 = on ? ggml_time_us() : 0;
+    }
+    ~llama_decode_trace() { if (on) fprintf(stderr, "DT %p %zu %lld %lld\n", ctx, n, (long long) t0, (long long) ggml_time_us()); }
+};
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    llama_decode_trace decode_trace(this, batch_inp.tokens.size());
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
