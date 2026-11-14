@@ -1770,7 +1770,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots);
+        // not cached = the misses computed on the CPU: from the pinned RAM tier when w is file-backed, else from w
+        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : (moe_cache->get_ram_experts(w) ? moe_cache->get_ram_experts(w) : w), cur_mm, slots);
 
     if (prec_policy) {
         prec_policy->apply(res);

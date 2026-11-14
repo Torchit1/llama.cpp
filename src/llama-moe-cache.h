@@ -27,6 +27,10 @@ public:
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
 
+    // local: the pinned RAM bank holding the experts of w that the CPU part of the graph reads in place of w,
+    // nullptr if w is not file-backed or there is no RAM tier (LLAMA_MOE_RAM_CACHE_MIB)
+    ggml_tensor * get_ram_experts(const ggml_tensor * w) const;
+
     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
     // nullptr if no misses of layer il are computed on the CPU for ubatches of n_tokens tokens
     ggml_tensor * get_cpu_map(int32_t il, int64_t n_tokens) const;

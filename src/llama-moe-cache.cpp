@@ -420,8 +420,10 @@ struct llama_moe_cache::impl {
     // an expert that is in neither is read from the file into the least recently used slot first.
     struct ram_tier {
         bool                                 ready      = false;
-        size_t                               slot_bytes = 0;
-        std::vector<size_t>                  t_off;      // offset of each expert tensor inside a slot
+        size_t                               slot_bytes = 0; // all tensors of one expert
+        std::vector<size_t>                  bank_off;   // start of each tensor's bank in the buffer: bank ip holds n_slots experts of tensor ip
+        std::vector<ggml_tensor *>           bank;       // host tensors over the banks, read by the CPU part of the graph
+        ggml_context_ptr                     ctx;
         int32_t                              n_slots    = 0;
         ggml_backend_buffer_ptr              buf;
         uint8_t *                            base       = nullptr;
@@ -449,7 +451,6 @@ struct llama_moe_cache::impl {
             }
             const group & g = groups[ig];
             for (const ggml_tensor * t : g.ref) {
-                r.t_off.push_back(r.slot_bytes);
                 r.slot_bytes += t->nb[2];
             }
             const size_t budget = host_total > 0 ? (size_t) ((double) mib*1024*1024*g.host_bytes/host_total) : 0;
@@ -459,15 +460,69 @@ struct llama_moe_cache::impl {
                 r.buf.reset(ggml_backend_buft_alloc_buffer(host ? host : ggml_backend_cpu_buffer_type(), (size_t) r.n_slots*r.slot_bytes));
             }
             if (r.buf) {
+                ggml_backend_buffer_set_usage(r.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                 r.base = (uint8_t *) ggml_backend_buffer_get_base(r.buf.get());
                 r.key_of.assign(r.n_slots, -1);
                 r.stamp.assign(r.n_slots, 0);
+                ggml_init_params params = { g.ref.size()*ggml_tensor_overhead(), nullptr, true };
+                r.ctx.reset(ggml_init(params));
+                size_t off = 0;
+                for (const ggml_tensor * t : g.ref) {
+                    r.bank_off.push_back(off);
+                    ggml_tensor * b = ggml_new_tensor_3d(r.ctx.get(), t->type, t->ne[0], t->ne[1], r.n_slots);
+                    b->buffer = r.buf.get();
+                    b->data   = r.base + off;
+                    ggml_set_name(b, "moe_ram_bank");
+                    r.bank.push_back(b);
+                    off += (size_t) r.n_slots*t->nb[2];
+                }
                 LLAMA_LOG_INFO("llama_moe_cache: RAM tier of group %zu: %d experts, %.2f MiB pinned\n", ig, r.n_slots, r.n_slots*r.slot_bytes/1024.0/1024.0);
             } else {
                 r.n_slots = 0;
             }
         }
         return r;
+    }
+
+    // the RAM bank that holds the experts of host tensor w, if w is file-backed and its group has a RAM tier
+    ggml_tensor * get_ram_experts(const ggml_tensor * w) {
+        const auto it = bindings.find(w);
+        if (it == bindings.end() || !llama_moe_cache_is_file_backed(w)) {
+            return nullptr;
+        }
+        const int32_t ig = layers[it->second.il].ig;
+        ram_tier & r = ram_of(devices[groups[ig].id].backend, ig);
+        return r.n_slots > 0 ? r.bank[it->second.ip] : nullptr;
+    }
+
+    // RAM slot of (layer il, expert e): looked up, or taken from the least recently used of the next 64 slots that this
+    // call does not use. read is set when the expert has to be read from the file into the slot.
+    int32_t ram_slot(ram_tier & r, int32_t il, int32_t e, uint64_t call_tick, bool & read) {
+        const int64_t key = ((int64_t) il << 20) | e;
+        auto it = r.slot_of.find(key);
+        int32_t s;
+        if (it != r.slot_of.end()) {
+            s    = it->second;
+            read = false;
+            ram_hits++;
+        } else {
+            s = -1;
+            for (int k = 0; k < 64; ++k) {
+                const int32_t cand = (r.hand + k) % r.n_slots;
+                if (r.stamp[cand] != call_tick && (s < 0 || r.stamp[cand] < r.stamp[s])) {
+                    s = cand;
+                }
+            }
+            r.hand = (r.hand + 64) % r.n_slots;
+            if (r.key_of[s] >= 0) {
+                r.slot_of.erase(r.key_of[s]);
+            }
+            r.key_of[s]    = key;
+            r.slot_of[key] = s;
+            read = true;
+        }
+        r.stamp[s] = call_tick;
+        return s;
     }
 
     uint8_t * stage_reserve(ggml_backend_t backend, size_t size) {
@@ -904,13 +959,14 @@ struct llama_moe_cache::impl {
             }
             l.cpu_experts.clear();
             for (const auto & f : cpu) {
-                cpu_map[f.expert] = f.expert;
+                cpu_map[f.expert] = f.expert; // replaced by the RAM slot below when the layer's experts are file-backed
                 l.cpu_experts.push_back(f.expert);
             }
         }
 
         // Where each missing expert of each tensor is uploaded from: the host tensor itself (pinned experts), a slot of
         // the RAM tier, or the staging buffer. File-backed experts are read by helper threads, one request per expert.
+        // The misses that the CPU computes are read from the RAM tier too, their cpu_map entries are the RAM slots.
         struct read_job { const uint8_t * src; uint8_t * dst; size_t size; };
         std::vector<read_job> jobs;
         std::vector<std::vector<const uint8_t *>> srcs(l.experts.size());
@@ -922,16 +978,16 @@ struct llama_moe_cache::impl {
                 for (size_t i = 0; i < fills.size(); ++i) {
                     srcs[ip][i] = (const uint8_t *) w->data + fills[i].expert*w->nb[2];
                 }
-                if (!fills.empty() && llama_moe_cache_is_file_backed(w)) {
+                if (llama_moe_cache_is_file_backed(w)) {
                     file_ips.push_back(ip);
                 }
             }
-            if (!file_ips.empty()) {
+            if (!file_ips.empty() && (!fills.empty() || !cpu.empty())) {
                 ram_tier & r = ram_of(backend, l.ig);
-                const bool use_ram = r.n_slots > 0 && fills.size() <= (size_t) r.n_slots/2;
+                const bool use_ram = r.n_slots > 0 && fills.size() + cpu.size() <= (size_t) r.n_slots/2;
                 uint8_t * stage = nullptr;
                 size_t    stage_offs = 0;
-                if (!use_ram) {
+                if (!use_ram && !fills.empty()) {
                     size_t need = 0;
                     for (size_t ip : file_ips) {
                         need += fills.size()*l.experts[ip]->nb[2];
@@ -939,53 +995,43 @@ struct llama_moe_cache::impl {
                     stage = stage_reserve(backend, need);
                 }
                 const uint64_t call_tick = ++r.tick;
+                auto queue_read = [&](size_t ip, int32_t expert, uint8_t * dst) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    const uint8_t * src = (const uint8_t *) w->data + expert*expert_size;
+#if defined(__linux__)
+                    const uintptr_t beg = (uintptr_t) src & ~(uintptr_t) 4095;
+                    madvise((void *) beg, (uintptr_t) src + expert_size - beg, MADV_WILLNEED);
+#endif
+                    jobs.push_back({ src, dst, expert_size });
+                };
                 for (size_t i = 0; i < fills.size(); ++i) {
-                    uint8_t * slot_base = nullptr;
-                    bool      read      = true;
-                    if (use_ram) {
-                        const int64_t key = ((int64_t) il << 20) | fills[i].expert;
-                        auto it = r.slot_of.find(key);
-                        int32_t s;
-                        if (it != r.slot_of.end()) {
-                            s    = it->second;
-                            read = false;
-                            ram_hits++;
-                        } else {
-                            // least recently used of the next 64 slots that this call does not use
-                            s = -1;
-                            for (int k = 0; k < 64; ++k) {
-                                const int32_t cand = (r.hand + k) % r.n_slots;
-                                if (r.stamp[cand] != call_tick && (s < 0 || r.stamp[cand] < r.stamp[s])) {
-                                    s = cand;
-                                }
-                            }
-                            r.hand = (r.hand + 64) % r.n_slots;
-                            if (r.key_of[s] >= 0) {
-                                r.slot_of.erase(r.key_of[s]);
-                            }
-                            r.key_of[s]    = key;
-                            r.slot_of[key] = s;
-                        }
-                        r.stamp[s] = call_tick;
-                        slot_base  = r.base + (size_t) s*r.slot_bytes;
-                    }
+                    bool    read = true;
+                    int32_t s    = use_ram ? ram_slot(r, il, fills[i].expert, call_tick, read) : -1;
                     for (size_t ip : file_ips) {
-                        const ggml_tensor * w = l.experts[ip];
-                        const size_t expert_size = w->nb[2];
-                        uint8_t * dst = use_ram ? slot_base + r.t_off[ip] : (stage ? stage + stage_offs : nullptr);
+                        const size_t expert_size = l.experts[ip]->nb[2];
+                        uint8_t * dst = use_ram ? r.base + r.bank_off[ip] + (size_t) s*expert_size : (stage ? stage + stage_offs : nullptr);
                         if (dst == nullptr) {
                             continue; // no pinned memory: upload from the file mapping as before
                         }
                         if (read) {
-                            const uint8_t * src = srcs[ip][i];
-#if defined(__linux__)
-                            const uintptr_t beg = (uintptr_t) src & ~(uintptr_t) 4095;
-                            madvise((void *) beg, (uintptr_t) src + expert_size - beg, MADV_WILLNEED);
-#endif
-                            jobs.push_back({ src, dst, expert_size });
+                            queue_read(ip, fills[i].expert, dst);
                         }
                         srcs[ip][i] = dst;
                         stage_offs += use_ram ? 0 : expert_size;
+                    }
+                }
+                if (use_ram && has_cpu && file_ips.size() == l.experts.size()) {
+                    int32_t * cpu_map = (int32_t *) l.cpu_map->data;
+                    for (const auto & f : cpu) {
+                        bool          read = true;
+                        const int32_t s    = ram_slot(r, il, f.expert, call_tick, read);
+                        if (read) {
+                            for (size_t ip : file_ips) {
+                                queue_read(ip, f.expert, r.base + r.bank_off[ip] + (size_t) s*l.experts[ip]->nb[2]);
+                            }
+                        }
+                        cpu_map[f.expert] = s; // the CPU part reads the RAM bank, see get_ram_experts()
                     }
                 }
             }
@@ -1079,6 +1125,10 @@ ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
+}
+
+ggml_tensor * llama_moe_cache::get_ram_experts(const ggml_tensor * w) const {
+    return pimpl->get_ram_experts(w);
 }
 
 ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {
