@@ -2927,6 +2927,10 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
     constexpr int NT_MAX      = GGML_SYCL_MOE_WINDOW_MAX_TOKENS;
     const int row_groups = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
     const bool compact   = ggml_live_switch("GGML_SYCL_MOE_WINDOW_COMPACT", 1) != 0;
+    // GGML_SYCL_MOE_NL_ALIGNED=0: the 16-bit loads of the unaligned layout. The aligned words may read two bytes past
+    // a block, so the last row of the tensor keeps to its own bytes only when the stride leaves that room.
+    const bool aligned   = ggml_live_switch("GGML_SYCL_MOE_NL_ALIGNED", 1) != 0 && (uintptr_t) vx_base % 4 == 0 &&
+                           expert_weight_stride % 4 == 0;
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(
             sycl::nd_range<2>(sycl::range<2>((size_t) n_ids * n_tokens, (size_t) row_groups * WARP_SIZE), sycl::range<2>(1, WARP_SIZE)),
@@ -2976,20 +2980,12 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
                     constexpr int dots_per_block = QI4_NL / VDR_IQ4_NL_Q8_1_MMVQ;
                     const int     n_dots         = (ncols / QK4_NL) * dots_per_block;
                     const int     ibx0           = row * (ncols / QK4_NL);
-                    for (int t = slice; t < n_dots; t += LPR) {
-                        const int            i   = t / dots_per_block;
-                        const int            iqs = VDR_IQ4_NL_Q8_1_MMVQ * (t % dots_per_block);
-                        const block_iq4_nl * bq  = &x[ibx0 + i];
-                        const uint16_t *     q4  = (const uint16_t *) bq->qs + 2 * iqs;
-                        // decode once
-                        const uint32_t aux0 = q4[0] | (q4[1] << 16);
-                        const uint32_t aux1 = q4[2] | (q4[3] << 16);
+                    // one dot product of 16 weights (two packed words) against every token that routes to this expert
+                    const auto dot16 = [&](const uint32_t aux0, const uint32_t aux1, const float d, const int i, const int iqs) {
                         const int v10 = (int) iq4nl_codes_to_int8(aux0 & 0x0f0f0f0f);
                         const int v20 = (int) iq4nl_codes_to_int8((aux0 >> 4) & 0x0f0f0f0f);
                         const int v11 = (int) iq4nl_codes_to_int8(aux1 & 0x0f0f0f0f);
                         const int v21 = (int) iq4nl_codes_to_int8((aux1 >> 4) & 0x0f0f0f0f);
-                        const float d = (float) bq->d;
-                        // one dot product per token that routes to this expert
                         for (int k = 0; k < nf; ++k) {
                             if (fk[k] >= 0) {
                                 const size_t       yrow = (size_t) kl[k] * y_rows_per_token + (y_rows_per_token == 1 ? 0 : fk[k]);
@@ -3001,6 +2997,33 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
                                 sumi     = dpct::dp4a(v21, q8[5], sumi);
                                 tmp[k] += d * y->ds[0] * sumi;
                             }
+                        }
+                    };
+                    if (aligned) {
+                        // The 18-byte blocks put the weights 2 bytes off a 4-byte boundary in every other block, and
+                        // such loads are several times slower here than aligned 4-byte ones. A lane takes whole
+                        // blocks: five aligned words hold the scale and the 16 weight bytes, shifted by 0 or 2 bytes.
+                        const uint32_t * xw = (const uint32_t *) x;
+                        for (int i = slice; i < ncols / QK4_NL; i += LPR) {
+                            const size_t     off = (size_t) (ibx0 + i) * sizeof(block_iq4_nl);
+                            const uint32_t * a   = xw + (off >> 2);
+                            const bool       hi  = (off & 2) != 0; // the block starts in the upper half of a[0]
+                            const uint32_t   a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3], a4 = a[4];
+                            const uint32_t   w0 = hi ? a1 : (a0 >> 16) | (a1 << 16);
+                            const uint32_t   w1 = hi ? a2 : (a1 >> 16) | (a2 << 16);
+                            const uint32_t   w2 = hi ? a3 : (a2 >> 16) | (a3 << 16);
+                            const uint32_t   w3 = hi ? a4 : (a3 >> 16) | (a4 << 16);
+                            const float      d  = (float) sycl::bit_cast<sycl::half>((uint16_t) (hi ? a0 >> 16 : a0 & 0xffff));
+                            dot16(w0, w1, d, i, 0);
+                            dot16(w2, w3, d, i, VDR_IQ4_NL_Q8_1_MMVQ);
+                        }
+                    } else {
+                        for (int t = slice; t < n_dots; t += LPR) {
+                            const int            i   = t / dots_per_block;
+                            const int            iqs = VDR_IQ4_NL_Q8_1_MMVQ * (t % dots_per_block);
+                            const block_iq4_nl * bq  = &x[ibx0 + i];
+                            const uint16_t *     q4  = (const uint16_t *) bq->qs + 2 * iqs;
+                            dot16(q4[0] | (q4[1] << 16), q4[2] | (q4[3] << 16), (float) bq->d, i, iqs);
                         }
                     }
                 }
@@ -3042,11 +3065,55 @@ static __dpct_inline__ int moe_swar_sub4(uint32_t a, uint32_t s) {
     return (int) (((a & 0x7F7F7F7Fu) + (s & 0x01010101u)) ^ (a & 0x80808080u));
 }
 
+// Bytes at any offset of an expert, read through aligned 32-bit words: on this hardware a load is the expensive part
+// of these kernels, and one aligned word costs no more than one byte. xw is the expert's first byte, 4-byte aligned.
+static __dpct_inline__ uint32_t moe_rd32(const uint32_t * xw, const size_t off) {
+    const uint32_t * a  = xw + (off >> 2);
+    const uint32_t   sh = (uint32_t) (off & 3) * 8;
+    const uint32_t   lo = a[0], hi = a[1];
+    return sh ? (lo >> sh) | (hi << (32 - sh)) : lo;
+}
+static __dpct_inline__ uint64_t moe_rd64(const uint32_t * xw, const size_t off) {
+    const uint32_t * a  = xw + (off >> 2);
+    const uint32_t   sh = (uint32_t) (off & 3) * 8;
+    const uint32_t   a0 = a[0], a1 = a[1], a2 = a[2];
+    const uint32_t   lo = sh ? (a0 >> sh) | (a1 << (32 - sh)) : a0;
+    const uint32_t   hi = sh ? (a1 >> sh) | (a2 << (32 - sh)) : a1;
+    return (uint64_t) lo | ((uint64_t) hi << 32);
+}
+static __dpct_inline__ uint32_t moe_rd8(const uint32_t * xw, const size_t off) {
+    return (xw[off >> 2] >> ((uint32_t) (off & 3) * 8)) & 0xff;
+}
+static __dpct_inline__ float moe_rd_half(const uint32_t * xw, const size_t off) { // off is even
+    return (float) sycl::bit_cast<sycl::half>((uint16_t) (xw[off >> 2] >> ((uint32_t) (off & 2) * 8)));
+}
+
 // Decoders of the 256-value superblock formats for the window kernel: one call decodes the 32 values of sub-block
 // ib32 into eight packed int8 words, with one weight-side scale for words 0..3 and one for words 4..7.
 struct moe_window_iq2_s {
     using block_t = block_iq2_s;
-    static __dpct_inline__ void decode(const block_t * bq2, const int ib32, int w[8], float & s1, float & s2) {
+    // xw / boff: the expert as aligned words and this block's byte offset in it (al), else bq2 is read byte by byte
+    static __dpct_inline__ void decode(const block_t * bq2, const uint32_t * xw, const size_t boff, const bool al,
+                                       const int ib32, int w[8], float & s1, float & s2) {
+        if (al) {
+            const uint32_t q  = moe_rd32(xw, boff + 2 + 4 * ib32);
+            const uint32_t sg = moe_rd32(xw, boff + 2 + QK_K / 8 + 4 * ib32);
+            const uint32_t qh = moe_rd8(xw, boff + 2 + QK_K / 4 + ib32);
+            const uint32_t sc = moe_rd8(xw, boff + 2 + QK_K / 4 + QK_K / 32 + ib32);
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const uint32_t * grid   = (const uint32_t *) (iq2s_grid + (((q >> (8 * l)) & 0xff) | ((qh << (8 - 2 * l)) & 0x300)));
+                const uint32_t   sb     = (sg >> (8 * l)) & 0xff;
+                const uint32_t   signs0 = moe_swar_ne4(((sb & 0xf) * 0x01010101) & 0x08040201);
+                const uint32_t   signs1 = moe_swar_ne4(((sb >> 4) * 0x01010101) & 0x08040201);
+                w[2 * l + 0] = moe_swar_sub4(grid[0] ^ signs0, signs0);
+                w[2 * l + 1] = moe_swar_sub4(grid[1] ^ signs1, signs1);
+            }
+            const float d = moe_rd_half(xw, boff) * 0.25f;
+            s1 = d * (0.5f + (sc & 0xf));
+            s2 = d * (0.5f + (sc >> 4));
+            return;
+        }
         const uint8_t * signs = bq2->qs + QK_K / 8 + 4 * ib32;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
@@ -3066,7 +3133,26 @@ struct moe_window_iq2_s {
 
 struct moe_window_iq3_xxs {
     using block_t = block_iq3_xxs;
-    static __dpct_inline__ void decode(const block_t * bq2, const int ib32, int w[8], float & s1, float & s2) {
+    static __dpct_inline__ void decode(const block_t * bq2, const uint32_t * xw, const size_t boff, const bool al,
+                                       const int ib32, int w[8], float & s1, float & s2) {
+        if (al) {
+            const uint64_t q     = moe_rd64(xw, boff + 2 + 8 * ib32);
+            uint32_t       aux32 = moe_rd32(xw, boff + 2 + QK_K / 4 + 4 * ib32);
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const uint32_t grid1     = iq3xxs_grid[(uint32_t) (q >> (16 * l)) & 0xff];
+                const uint32_t grid2     = iq3xxs_grid[(uint32_t) (q >> (16 * l + 8)) & 0xff];
+                const uint32_t sign_bits = iq_sign_bits(aux32);
+                const uint32_t signs0    = iq_sign_mask(sign_bits);
+                const uint32_t signs1    = iq_sign_mask(sign_bits >> 4);
+                w[2 * l + 0] = (grid1 ^ signs0) + (signs0 & 0x01010101);
+                w[2 * l + 1] = (grid2 ^ signs1) + (signs1 & 0x01010101);
+                aux32 >>= 7;
+            }
+            s1 = moe_rd_half(xw, boff) * (0.5f + aux32) * 0.5f;
+            s2 = s1;
+            return;
+        }
         const uint8_t *  q3  = bq2->qs + 8 * ib32;
         const uint16_t * gas = (const uint16_t *) (bq2->qs + QK_K / 4) + 2 * ib32;
         uint32_t aux32 = gas[0] | (gas[1] << 16);
@@ -3088,7 +3174,27 @@ struct moe_window_iq3_xxs {
 
 struct moe_window_iq3_s {
     using block_t = block_iq3_s;
-    static __dpct_inline__ void decode(const block_t * bq2, const int ib32, int w[8], float & s1, float & s2) {
+    static __dpct_inline__ void decode(const block_t * bq2, const uint32_t * xw, const size_t boff, const bool al,
+                                       const int ib32, int w[8], float & s1, float & s2) {
+        if (al) {
+            const uint64_t q  = moe_rd64(xw, boff + 2 + 8 * ib32);
+            const uint32_t qh = moe_rd8(xw, boff + 2 + QK_K / 4 + ib32);
+            const uint32_t sg = moe_rd32(xw, boff + 2 + QK_K / 4 + QK_K / 32 + 4 * ib32);
+            const uint32_t sc = moe_rd8(xw, boff + 2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + ib32 / 2);
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const uint32_t grid1  = iq3s_grid[((uint32_t) (q >> (16 * l)) & 0xff) | ((qh << (8 - 2 * l)) & 256)];
+                const uint32_t grid2  = iq3s_grid[((uint32_t) (q >> (16 * l + 8)) & 0xff) | ((qh << (7 - 2 * l)) & 256)];
+                const uint32_t signs  = (sg >> (8 * l)) & 0xff;
+                const uint32_t signs0 = iq_sign_mask(signs);
+                const uint32_t signs1 = iq_sign_mask(signs >> 4);
+                w[2 * l + 0] = (grid1 ^ signs0) + (signs0 & 0x01010101);
+                w[2 * l + 1] = (grid2 ^ signs1) + (signs1 & 0x01010101);
+            }
+            s1 = moe_rd_half(xw, boff) * (1 + 2 * ((sc >> 4 * (ib32 % 2)) & 0xf));
+            s2 = s1;
+            return;
+        }
         const uint8_t * qs = bq2->qs + 8 * ib32;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
@@ -3117,6 +3223,9 @@ static void launch_mul_mat_vec_grid_moe_window(
     constexpr int NT_MAX      = GGML_SYCL_MOE_WINDOW_MAX_TOKENS;
     const int row_groups = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
     const bool compact   = ggml_live_switch("GGML_SYCL_MOE_WINDOW_COMPACT", 1) != 0;
+    // GGML_SYCL_MOE_GRID_ALIGNED=0: byte loads
+    const bool aligned   = ggml_live_switch("GGML_SYCL_MOE_GRID_ALIGNED", 1) != 0 && (uintptr_t) vx_base % 4 == 0 &&
+                           expert_weight_stride % 4 == 0;
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(
             sycl::nd_range<2>(sycl::range<2>((size_t) n_ids * n_tokens, (size_t) row_groups * WARP_SIZE), sycl::range<2>(1, WARP_SIZE)),
@@ -3171,7 +3280,8 @@ static void launch_mul_mat_vec_grid_moe_window(
                         const int ib32 = t % dots_per_block;
                         int   w[8];
                         float s1, s2;
-                        DEC::decode(&x[ibx0 + i], ib32, w, s1, s2); // once, for every token that routes here
+                        // once, for every token that routes here
+                        DEC::decode(&x[ibx0 + i], (const uint32_t *) x, (size_t) (ibx0 + i) * sizeof(block_t), aligned, ib32, w, s1, s2);
                         for (int k = 0; k < nf; ++k) {
                             if (fk[k] >= 0) {
                                 const size_t       yrow = (size_t) kl[k] * y_rows_per_token + (y_rows_per_token == 1 ? 0 : fk[k]);
