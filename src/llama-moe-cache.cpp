@@ -520,7 +520,9 @@ struct llama_moe_cache::impl {
             }
             const size_t budget = host_total > 0 ? (size_t) ((double) mib*1024*1024*g.host_bytes/host_total) : 0;
             r.n_slots = r.slot_bytes > 0 ? (int32_t) (budget/r.slot_bytes) : 0;
-            if (r.n_slots >= 8*n_expert_used) {
+            // at least two layers' worth of experts: one call can then always place every expert it touches, which the
+            // CPU part relies on (its ids are RAM slots, there is no fallback once the graph reads the RAM bank)
+            if (r.n_slots >= 2*(int32_t) g.ref[0]->ne[2]) {
                 ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
                 r.buf.reset(ggml_backend_buft_alloc_buffer(host ? host : ggml_backend_cpu_buffer_type(), (size_t) r.n_slots*r.slot_bytes));
             }
@@ -571,13 +573,15 @@ struct llama_moe_cache::impl {
             read = false;
             ram_hits++;
         } else {
+            // least recently used of the next 64 slots that this call does not use; keep going if all 64 are in use by it
             s = -1;
-            for (int k = 0; k < 64; ++k) {
+            for (int32_t k = 0; k < r.n_slots && (k < 64 || s < 0); ++k) {
                 const int32_t cand = (r.hand + k) % r.n_slots;
                 if (r.stamp[cand] != call_tick && (s < 0 || r.stamp[cand] < r.stamp[s])) {
                     s = cand;
                 }
             }
+            GGML_ASSERT(s >= 0 && "the RAM tier is smaller than the experts of one call");
             r.hand = (r.hand + 64) % r.n_slots;
             if (r.key_of[s] >= 0) {
                 r.slot_of.erase(r.key_of[s]);
@@ -1123,7 +1127,7 @@ struct llama_moe_cache::impl {
             }
             if (!file_ips.empty() && (!fills.empty() || !cpu.empty())) {
                 ram_tier & r = ram_of(backend, l.ig);
-                const bool use_ram = r.n_slots > 0 && fills.size() + cpu.size() <= (size_t) r.n_slots/2;
+                const bool use_ram = r.n_slots > 0; // a call touches at most one layer's experts, the tier holds two or more
                 uint8_t * stage = nullptr;
                 size_t    stage_offs = 0;
                 if (!use_ram && !fills.empty()) {
