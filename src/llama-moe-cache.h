@@ -31,6 +31,10 @@ public:
     // nullptr if w is not file-backed or there is no RAM tier (LLAMA_MOE_RAM_CACHE_MIB)
     ggml_tensor * get_ram_experts(const ggml_tensor * w) const;
 
+    // local: upload bytes [offset, offset + size) of host tensor w to its device copy dst through pinned memory, if w is
+    // file-backed; returns false (nothing done) for any other tensor
+    bool upload_file_backed(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, size_t offset, size_t size);
+
     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
     // nullptr if no misses of layer il are computed on the CPU for ubatches of n_tokens tokens
     ggml_tensor * get_cpu_map(int32_t il, int64_t n_tokens) const;

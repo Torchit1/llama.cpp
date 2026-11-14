@@ -525,6 +525,56 @@ struct llama_moe_cache::impl {
         return s;
     }
 
+    // Large batches upload long runs of experts. For a file-backed tensor they go through the pinned staging buffer in
+    // chunks read by helper threads, never straight from the file mapping (slow, and it lost the device on Arc cards).
+    size_t stage_used = SIZE_MAX; // SIZE_MAX: the buffer may hold data of queued copies, synchronize before reuse
+
+    bool upload_file_backed(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, size_t offset, size_t size) {
+        if (!llama_moe_cache_is_file_backed(w)) {
+            return false;
+        }
+        constexpr size_t arena = 256ull*1024*1024;
+        constexpr size_t chunk = 32ull*1024*1024;
+        uint8_t * base = stage_reserve(backend, arena);
+        if (base == nullptr) {
+            return false;
+        }
+        const uint8_t * src = (const uint8_t *) w->data + offset;
+#if defined(__linux__)
+        {
+            const uintptr_t beg = (uintptr_t) src & ~(uintptr_t) 4095;
+            madvise((void *) beg, (uintptr_t) src + size - beg, MADV_WILLNEED);
+        }
+#endif
+        for (size_t done = 0; done < size; ) {
+            const size_t n = std::min(chunk, size - done);
+            if (stage_used == SIZE_MAX || stage_used + n > arena) {
+                ggml_backend_synchronize(backend);
+                stage_used = 0;
+            }
+            uint8_t * d = base + stage_used;
+            const size_t n_thr = n >= 8*1024*1024 ? 8 : 1;
+            const size_t part  = (n + n_thr - 1)/n_thr;
+            std::vector<std::thread> thr;
+            for (size_t t = 1; t < n_thr; ++t) {
+                const size_t o = t*part;
+                if (o < n) {
+                    thr.emplace_back([=] { memcpy(d + o, src + done + o, std::min(part, n - o)); });
+                }
+            }
+            memcpy(d, src + done, std::min(part, n));
+            for (auto & t : thr) {
+                t.join();
+            }
+            ggml_backend_tensor_set_async(backend, dst, d, offset + done, n);
+            stage_used  += n;
+            stage_bytes += n;
+            done        += n;
+        }
+        stage_reads++;
+        return true;
+    }
+
     uint8_t * stage_reserve(ggml_backend_t backend, size_t size) {
         if (size > stage_size) {
             ggml_backend_synchronize(backend); // copies out of the old buffer may still be queued
@@ -1059,6 +1109,8 @@ struct llama_moe_cache::impl {
             }
         }
 
+        stage_used = SIZE_MAX; // the staging buffer may now be read by queued copies
+
         // upload the missing experts, consecutive experts going to consecutive slots from consecutive memory are uploaded together
         size_t bytes = 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
@@ -1129,6 +1181,10 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
 
 ggml_tensor * llama_moe_cache::get_ram_experts(const ggml_tensor * w) const {
     return pimpl->get_ram_experts(w);
+}
+
+bool llama_moe_cache::upload_file_backed(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, size_t offset, size_t size) {
+    return pimpl->upload_file_backed(backend, w, dst, offset, size);
 }
 
 ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {

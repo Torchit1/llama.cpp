@@ -3248,7 +3248,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 e++;
                 continue;
             }
-            if (next < e) {
+            if (next < e && !lctx->moe_cache->upload_file_backed(backend, src, dst, next*expert_size, (e - next)*expert_size)) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
             }
             e   += n;
@@ -3259,7 +3259,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t offset  = next*expert_size;
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
-        if (size > 0) {
+        if (size > 0 && !(lctx->moe_cache && lctx->moe_cache->upload_file_backed(backend, src, dst, offset, size))) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
         }
 
