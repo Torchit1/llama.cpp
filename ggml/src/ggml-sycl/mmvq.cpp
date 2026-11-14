@@ -2926,6 +2926,7 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
     constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
     constexpr int NT_MAX      = GGML_SYCL_MOE_WINDOW_MAX_TOKENS;
     const int row_groups = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
+    const bool compact   = ggml_live_switch("GGML_SYCL_MOE_WINDOW_COMPACT", 1) != 0;
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(
             sycl::nd_range<2>(sycl::range<2>((size_t) n_ids * n_tokens, (size_t) row_groups * WARP_SIZE), sycl::range<2>(1, WARP_SIZE)),
@@ -2938,13 +2939,31 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
                 const int row   = item.get_group(1) * ROWS_PER_SG + lane / LPR;
                 const int i02   = ((const int32_t *) ((const char *) ids_base + (size_t) tok * ids_token_stride))[slot];
 
-                int32_t fk[NT_MAX];
-                bool    leader = false;
+                // the tokens this route computes, packed to the front: the dot loop then runs once per real consumer
+                // instead of testing every token of the window for each block
+                int32_t kl[NT_MAX], fk[NT_MAX];
+                int     nf = 0;
 #pragma unroll
                 for (int k = 0; k < NT_MAX; ++k) {
-                    fk[k]  = k < n_tokens ? fol[p * n_tokens + k] : -1;
-                    leader = leader || fk[k] >= 0;
+                    kl[k] = 0;
+                    fk[k] = -1;
                 }
+#pragma unroll
+                for (int k = 0; k < NT_MAX; ++k) {
+                    const int32_t f = k < n_tokens ? fol[p * n_tokens + k] : -1;
+                    if (compact) {
+                        if (f >= 0) {
+                            kl[nf] = k;
+                            fk[nf] = f;
+                            ++nf;
+                        }
+                    } else {
+                        kl[k] = k;
+                        fk[k] = f;
+                        nf    = f >= 0 ? NT_MAX : nf;
+                    }
+                }
+                const bool leader = nf > 0;
 
                 float tmp[NT_MAX];
 #pragma unroll
@@ -2971,10 +2990,9 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
                         const int v21 = (int) iq4nl_codes_to_int8((aux1 >> 4) & 0x0f0f0f0f);
                         const float d = (float) bq->d;
                         // one dot product per token that routes to this expert
-#pragma unroll
-                        for (int k = 0; k < NT_MAX; ++k) {
+                        for (int k = 0; k < nf; ++k) {
                             if (fk[k] >= 0) {
-                                const size_t       yrow = (size_t) k * y_rows_per_token + (y_rows_per_token == 1 ? 0 : fk[k]);
+                                const size_t       yrow = (size_t) kl[k] * y_rows_per_token + (y_rows_per_token == 1 ? 0 : fk[k]);
                                 const block_q8_1 * y    = (const block_q8_1 *) ((const char *) vy_base + yrow * y_row_bytes) + i;
                                 const int32_t *    q8   = (const int32_t *) y->qs + iqs;
                                 int sumi = dpct::dp4a(v10, q8[0], 0);
@@ -3003,7 +3021,7 @@ static void launch_mul_mat_vec_iq4_nl_moe_window(
 #pragma unroll
                     for (int k = 0; k < NT_MAX; ++k) {
                         if (fk[k] >= 0) {
-                            float * dst = (float *) ((char *) dst_base + (size_t) k * dst_token_stride + (size_t) fk[k] * dst_row_stride);
+                            float * dst = (float *) ((char *) dst_base + (size_t) kl[k] * dst_token_stride + (size_t) fk[k] * dst_row_stride);
                             dst[row]    = tmp[k];
                         }
                     }
@@ -3098,6 +3116,7 @@ static void launch_mul_mat_vec_grid_moe_window(
     constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
     constexpr int NT_MAX      = GGML_SYCL_MOE_WINDOW_MAX_TOKENS;
     const int row_groups = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
+    const bool compact   = ggml_live_switch("GGML_SYCL_MOE_WINDOW_COMPACT", 1) != 0;
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(
             sycl::nd_range<2>(sycl::range<2>((size_t) n_ids * n_tokens, (size_t) row_groups * WARP_SIZE), sycl::range<2>(1, WARP_SIZE)),
@@ -3110,13 +3129,31 @@ static void launch_mul_mat_vec_grid_moe_window(
                 const int row   = item.get_group(1) * ROWS_PER_SG + lane / LPR;
                 const int i02   = ((const int32_t *) ((const char *) ids_base + (size_t) tok * ids_token_stride))[slot];
 
-                int32_t fk[NT_MAX];
-                bool    leader = false;
+                // the tokens this route computes, packed to the front: the dot loop then runs once per real consumer
+                // instead of testing every token of the window for each block
+                int32_t kl[NT_MAX], fk[NT_MAX];
+                int     nf = 0;
 #pragma unroll
                 for (int k = 0; k < NT_MAX; ++k) {
-                    fk[k]  = k < n_tokens ? fol[p * n_tokens + k] : -1;
-                    leader = leader || fk[k] >= 0;
+                    kl[k] = 0;
+                    fk[k] = -1;
                 }
+#pragma unroll
+                for (int k = 0; k < NT_MAX; ++k) {
+                    const int32_t f = k < n_tokens ? fol[p * n_tokens + k] : -1;
+                    if (compact) {
+                        if (f >= 0) {
+                            kl[nf] = k;
+                            fk[nf] = f;
+                            ++nf;
+                        }
+                    } else {
+                        kl[k] = k;
+                        fk[k] = f;
+                        nf    = f >= 0 ? NT_MAX : nf;
+                    }
+                }
+                const bool leader = nf > 0;
 
                 float tmp[NT_MAX];
 #pragma unroll
@@ -3135,10 +3172,9 @@ static void launch_mul_mat_vec_grid_moe_window(
                         int   w[8];
                         float s1, s2;
                         DEC::decode(&x[ibx0 + i], ib32, w, s1, s2); // once, for every token that routes here
-#pragma unroll
-                        for (int k = 0; k < NT_MAX; ++k) {
+                        for (int k = 0; k < nf; ++k) {
                             if (fk[k] >= 0) {
-                                const size_t       yrow = (size_t) k * y_rows_per_token + (y_rows_per_token == 1 ? 0 : fk[k]);
+                                const size_t       yrow = (size_t) kl[k] * y_rows_per_token + (y_rows_per_token == 1 ? 0 : fk[k]);
                                 const block_q8_1 * y    = (const block_q8_1 *) ((const char *) vy_base + yrow * y_row_bytes) + t;
                                 const int *        q8   = (const int *) y->qs;
                                 int sum1 = dpct::dp4a(w[0], q8[0], 0);
@@ -3171,7 +3207,7 @@ static void launch_mul_mat_vec_grid_moe_window(
 #pragma unroll
                     for (int k = 0; k < NT_MAX; ++k) {
                         if (fk[k] >= 0) {
-                            float * dst = (float *) ((char *) dst_base + (size_t) k * dst_token_stride + (size_t) fk[k] * dst_row_stride);
+                            float * dst = (float *) ((char *) dst_base + (size_t) kl[k] * dst_token_stride + (size_t) fk[k] * dst_row_stride);
                             dst[row]    = tmp[k];
                         }
                     }

@@ -67,6 +67,29 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
+// LLAMA_SRV_PHASE=N: every N speculative cycles print where the server loop's wall time went (ms per cycle)
+static void srv_phase(int id) {
+    static const int every = getenv("LLAMA_SRV_PHASE") ? atoi(getenv("LLAMA_SRV_PHASE")) : 0;
+    if (every <= 0) {
+        return;
+    }
+    static const char * names[] = { "outside", "pre", "draft", "ckpt", "decode", "sample", "post" };
+    static int64_t acc[7] = {}, t_last = 0, n = 0;
+    const int64_t t = ggml_time_us();
+    if (t_last != 0) {
+        acc[id] += t - t_last;
+    }
+    t_last = t;
+    if (id == 5 && ++n % every == 0) {
+        std::string line;
+        for (int i = 0; i < 7; i++) {
+            line += string_format(" %s %.2f", names[i], acc[i] / 1000.0 / every);
+            acc[i] = 0;
+        }
+        fprintf(stderr, "SRVPHASE%s\n", line.c_str());
+    }
+}
+
 // a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
 static std::vector<llama_token> server_accept_replay(
         common_sampler * smpl,
@@ -3556,6 +3579,7 @@ private:
     }
 
     void update_slots() {
+        srv_phase(0);
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3926,6 +3950,7 @@ private:
             }
         });
 
+        srv_phase(1);
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
@@ -3933,6 +3958,7 @@ private:
             });
         }
 
+        srv_phase(2);
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
@@ -3985,6 +4011,7 @@ private:
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        srv_phase(3);
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -4938,6 +4965,7 @@ private:
             slot.print_timings_tg();
         });
 
+        srv_phase(4);
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
@@ -4979,6 +5007,7 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+                srv_phase(5);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
