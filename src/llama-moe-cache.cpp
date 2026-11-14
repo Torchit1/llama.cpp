@@ -12,8 +12,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace {
 
@@ -309,6 +314,11 @@ static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, co
     return true;
 }
 
+// an expert tensor that is not in RAM but a view of the model file (the disk tier, see moe_host_tier in the loader)
+static bool llama_moe_cache_is_file_backed(const ggml_tensor * t) {
+    return t->buffer != nullptr && strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)), "CPU_Mapped") == 0;
+}
+
 static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
     return t->buffer != nullptr &&
         ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
@@ -397,6 +407,24 @@ struct llama_moe_cache::impl {
 
     // views used by copy_experts
     ggml_context_ptr ctx_views;
+
+    // Disk tier: experts of file-backed tensors are read into this pinned buffer by helper threads and uploaded from
+    // it, instead of the device copying them page fault by page fault out of the file mapping.
+    ggml_backend_buffer_ptr stage_buf;
+    size_t                  stage_size  = 0;
+    size_t                  stage_bytes = 0; // read from the file so far
+    size_t                  stage_reads = 0;
+
+    uint8_t * stage_reserve(ggml_backend_t backend, size_t size) {
+        if (size > stage_size) {
+            ggml_backend_synchronize(backend); // copies out of the old buffer may still be queued
+            const size_t want = size + size / 2;
+            ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+            stage_buf.reset(ggml_backend_buft_alloc_buffer(host ? host : ggml_backend_cpu_buffer_type(), want));
+            stage_size = stage_buf ? want : 0;
+        }
+        return stage_buf ? (uint8_t *) ggml_backend_buffer_get_base(stage_buf.get()) : nullptr;
+    }
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
@@ -826,6 +854,59 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // disk tier: read the missing experts of file-backed tensors into the pinned staging buffer, in parallel
+        struct stage_job { const uint8_t * src; uint8_t * dst; size_t size; };
+        std::vector<stage_job> jobs;
+        std::vector<const uint8_t *> staged(l.experts.size(), nullptr); // per tensor: start of its staged experts, in fills order
+        {
+            size_t need = 0;
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                if (!fills.empty() && llama_moe_cache_is_file_backed(l.experts[ip])) {
+                    need += fills.size()*l.experts[ip]->nb[2];
+                }
+            }
+            uint8_t * base = need > 0 ? stage_reserve(backend, need) : nullptr;
+            size_t offs = 0;
+            for (size_t ip = 0; base != nullptr && ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                if (!llama_moe_cache_is_file_backed(w)) {
+                    continue;
+                }
+                const size_t expert_size = w->nb[2];
+                staged[ip] = base + offs;
+                for (size_t i = 0; i < fills.size(); ++i) {
+                    const uint8_t * src = (const uint8_t *) w->data + fills[i].expert*expert_size;
+#if defined(__linux__)
+                    // start the reads of the whole expert now: one request per expert, not one per page
+                    const size_t page = 4096;
+                    const uintptr_t beg = (uintptr_t) src & ~(page - 1);
+                    madvise((void *) beg, (uintptr_t) src + expert_size - beg, MADV_WILLNEED);
+#endif
+                    jobs.push_back({ src, base + offs, expert_size });
+                    offs += expert_size;
+                }
+            }
+            if (!jobs.empty()) {
+                const size_t n_thr = std::min<size_t>(8, jobs.size());
+                std::vector<std::thread> thr;
+                for (size_t t = 1; t < n_thr; ++t) {
+                    thr.emplace_back([&jobs, t, n_thr] {
+                        for (size_t j = t; j < jobs.size(); j += n_thr) {
+                            memcpy(jobs[j].dst, jobs[j].src, jobs[j].size);
+                        }
+                    });
+                }
+                for (size_t j = 0; j < jobs.size(); j += n_thr) {
+                    memcpy(jobs[j].dst, jobs[j].src, jobs[j].size);
+                }
+                for (auto & t : thr) {
+                    t.join();
+                }
+                stage_bytes += offs;
+                stage_reads += jobs.size();
+            }
+        }
+
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
@@ -837,7 +918,9 @@ struct llama_moe_cache::impl {
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                // staged experts sit in fills order, so a run of consecutive fills is contiguous there too
+                const uint8_t * src = staged[ip] != nullptr ? staged[ip] + i*expert_size : (const uint8_t *) w->data + fills[i].expert*expert_size;
+                ggml_backend_tensor_set_async(backend, bank, src, fills[i].slot*expert_size, n*expert_size);
                 bytes += n*expert_size;
                 i += n;
             }
@@ -856,6 +939,9 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        if (stage_reads > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: disk tier: %zu experts read from the file, %.2f MiB\n", stage_reads, stage_bytes/1024.0/1024.0);
+        }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {

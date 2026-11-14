@@ -90,7 +90,8 @@ struct llama_model_loader {
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
-        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+        // force: lazy whatever the mode and size (host experts beyond the RAM budget, see moe_host_tier)
+        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force = false);
 
         bool any() const {
             return !ranges.empty();
@@ -114,6 +115,15 @@ struct llama_model_loader {
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
     } lazy;
+
+    // Local experiment, the RAM tier of host-resident MoE experts: LLAMA_MOE_HOST_PIN_MIB=N keeps the first N MiB of the
+    // expert tensors overridden to the CPU in (pinned) RAM as usual, and leaves the rest file-backed, read on demand
+    // by the MoE cache. Decided once per tensor name so that every create_tensor() pass agrees.
+    struct moe_host_tier {
+        std::map<std::string, bool> on_disk;
+        size_t                      pinned_bytes = 0;
+        size_t                      disk_bytes   = 0;
+    } moe_tier;
 
     llama_files files;
     llama_ftype ftype;

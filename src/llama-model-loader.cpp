@@ -1180,14 +1180,14 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
-    if (mode == LLAMA_LAZY_MODE_OFF) {
+bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force) {
+    if (!force && mode == LLAMA_LAZY_MODE_OFF) {
         return false;
     }
 
     // do not lazy-read small tensors, it has significant overhead and is not worth it
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    if (!force && mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
         return false;
     }
 
@@ -1437,6 +1437,30 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (flags & TENSOR_READ_LAZY) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+    }
+
+    // RAM tier of the host experts: past the budget an expert tensor that is overridden to the CPU stays file-backed
+    if (!is_lazy && tensor_buft_overrides && tn.bid >= 0) {
+        static const long long pin_mib = getenv("LLAMA_MOE_HOST_PIN_MIB") ? atoll(getenv("LLAMA_MOE_HOST_PIN_MIB")) : -1;
+        const std::string name = tn.str();
+        if (pin_mib >= 0 && name.find("_exps.") != std::string::npos) {
+            bool to_cpu = false;
+            for (const auto * ov = tensor_buft_overrides; ov->pattern != nullptr && !to_cpu; ++ov) {
+                to_cpu = ov->buft == ggml_backend_cpu_buffer_type() && std::regex_search(name, std::regex(ov->pattern));
+            }
+            if (to_cpu) {
+                auto it = moe_tier.on_disk.find(name);
+                if (it == moe_tier.on_disk.end()) {
+                    const size_t sz   = ggml_nbytes(cur);
+                    const bool   disk = moe_tier.pinned_bytes + sz > (size_t) pin_mib * 1024 * 1024;
+                    (disk ? moe_tier.disk_bytes : moe_tier.pinned_bytes) += sz;
+                    it = moe_tier.on_disk.emplace(name, disk).first;
+                }
+                if (it->second) {
+                    is_lazy = lazy.add(name, cur, no_alloc ? nullptr : &require_weight(name.c_str()), /*force=*/ true);
+                }
+            }
+        }
     }
 
     ggml_tensor t_meta = *cur;
