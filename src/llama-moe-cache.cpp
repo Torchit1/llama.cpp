@@ -17,7 +17,11 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#include <mutex>
+#include <string>
 #endif
 
 namespace {
@@ -314,6 +318,67 @@ static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, co
     return true;
 }
 
+// Reads `size` bytes at `src`, an address inside a file mapping, into dst with read calls on the file itself: one request
+// per range with the kernel's normal read-ahead, where copying from the mapping takes a page fault per 4 KiB because
+// the lazy tensors are mapped with random-access advice. Falls back to memcpy if the mapping cannot be resolved.
+static void llama_moe_cache_read_file(const uint8_t * src, uint8_t * dst, size_t size) {
+#if defined(__linux__)
+    struct map_entry { uintptr_t beg, end; off_t offs; int fd; };
+    static std::mutex             mtx;
+    static std::vector<map_entry> maps;
+    auto find = [&](uintptr_t p) -> const map_entry * {
+        for (const map_entry & m : maps) {
+            if (p >= m.beg && p < m.end) {
+                return &m;
+            }
+        }
+        return nullptr;
+    };
+    map_entry m = { 0, 0, 0, -1 };
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        const map_entry * e = find((uintptr_t) src);
+        if (e == nullptr) {
+            if (FILE * f = fopen("/proc/self/maps", "r")) {
+                char line[4096];
+                while (fgets(line, sizeof(line), f)) {
+                    unsigned long beg, end, offs;
+                    char          perms[8], path[3072];
+                    path[0] = 0;
+                    if (sscanf(line, "%lx-%lx %7s %lx %*s %*s %3071[^\n]", &beg, &end, perms, &offs, path) >= 4 &&
+                        (uintptr_t) src >= beg && (uintptr_t) src < end && path[0] == '/') {
+                        const int fd = open(path, O_RDONLY);
+                        if (fd >= 0) {
+                            maps.push_back({ (uintptr_t) beg, (uintptr_t) end, (off_t) offs, fd });
+                        }
+                    }
+                }
+                fclose(f);
+            }
+            e = find((uintptr_t) src);
+        }
+        if (e != nullptr) {
+            m = *e;
+        }
+    }
+    if (m.fd >= 0 && (uintptr_t) src + size <= m.end) {
+        off_t  offs = m.offs + (off_t) ((uintptr_t) src - m.beg);
+        size_t done = 0;
+        while (done < size) {
+            const ssize_t n = pread(m.fd, dst + done, size - done, offs + (off_t) done);
+            if (n <= 0) {
+                break;
+            }
+            done += (size_t) n;
+        }
+        if (done == size) {
+            return;
+        }
+    }
+#endif
+    memcpy(dst, src, size);
+}
+
 // an expert tensor that is not in RAM but a view of the model file (the disk tier, see moe_host_tier in the loader)
 static bool llama_moe_cache_is_file_backed(const ggml_tensor * t) {
     return t->buffer != nullptr && strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)), "CPU_Mapped") == 0;
@@ -533,6 +598,36 @@ struct llama_moe_cache::impl {
         if (!llama_moe_cache_is_file_backed(w)) {
             return false;
         }
+        // experts of the run that sit in the RAM tier are uploaded from their pinned slots, the rest come from the file
+        const auto it = bindings.find(w);
+        if (it != bindings.end()) {
+            const int32_t il = it->second.il;
+            const size_t  ip = it->second.ip;
+            ram_tier & r = ram_of(backend, layers[il].ig);
+            const size_t expert_size = w->nb[2];
+            if (r.n_slots > 0 && offset % expert_size == 0) {
+                const size_t end = offset + size;
+                size_t disk_beg = offset; // start of the pending run that is not in RAM
+                for (size_t o = offset; o < end; o += expert_size) {
+                    const size_t n = std::min(expert_size, end - o);
+                    const auto s = n == expert_size ? r.slot_of.find(((int64_t) il << 20) | (int64_t) (o/expert_size)) : r.slot_of.end();
+                    if (s == r.slot_of.end()) {
+                        continue;
+                    }
+                    if (disk_beg < o && !upload_staged(backend, w, dst, disk_beg, o - disk_beg)) {
+                        return false;
+                    }
+                    ggml_backend_tensor_set_async(backend, dst, r.base + r.bank_off[ip] + (size_t) s->second*expert_size, o, expert_size);
+                    ram_hits++;
+                    disk_beg = o + expert_size;
+                }
+                return disk_beg >= end || upload_staged(backend, w, dst, disk_beg, end - disk_beg);
+            }
+        }
+        return upload_staged(backend, w, dst, offset, size);
+    }
+
+    bool upload_staged(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, size_t offset, size_t size) {
         constexpr size_t arena = 256ull*1024*1024;
         constexpr size_t chunk = 32ull*1024*1024;
         uint8_t * base = stage_reserve(backend, arena);
@@ -540,12 +635,6 @@ struct llama_moe_cache::impl {
             return false;
         }
         const uint8_t * src = (const uint8_t *) w->data + offset;
-#if defined(__linux__)
-        {
-            const uintptr_t beg = (uintptr_t) src & ~(uintptr_t) 4095;
-            madvise((void *) beg, (uintptr_t) src + size - beg, MADV_WILLNEED);
-        }
-#endif
         for (size_t done = 0; done < size; ) {
             const size_t n = std::min(chunk, size - done);
             if (stage_used == SIZE_MAX || stage_used + n > arena) {
@@ -559,10 +648,10 @@ struct llama_moe_cache::impl {
             for (size_t t = 1; t < n_thr; ++t) {
                 const size_t o = t*part;
                 if (o < n) {
-                    thr.emplace_back([=] { memcpy(d + o, src + done + o, std::min(part, n - o)); });
+                    thr.emplace_back([=] { llama_moe_cache_read_file(src + done + o, d + o, std::min(part, n - o)); });
                 }
             }
-            memcpy(d, src + done, std::min(part, n));
+            llama_moe_cache_read_file(src + done, d, std::min(part, n));
             for (auto & t : thr) {
                 t.join();
             }
@@ -1091,12 +1180,12 @@ struct llama_moe_cache::impl {
                 for (size_t t = 1; t < n_thr; ++t) {
                     thr.emplace_back([&jobs, t, n_thr] {
                         for (size_t j = t; j < jobs.size(); j += n_thr) {
-                            memcpy(jobs[j].dst, jobs[j].src, jobs[j].size);
+                            llama_moe_cache_read_file(jobs[j].src, jobs[j].dst, jobs[j].size);
                         }
                     });
                 }
                 for (size_t j = 0; j < jobs.size(); j += n_thr) {
-                    memcpy(jobs[j].dst, jobs[j].src, jobs[j].size);
+                    llama_moe_cache_read_file(jobs[j].src, jobs[j].dst, jobs[j].size);
                 }
                 for (auto & t : thr) {
                     t.join();
