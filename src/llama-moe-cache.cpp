@@ -61,6 +61,7 @@ struct moe_cache_lru {
     std::vector<int32_t> uniq;  // the distinct selected experts
     std::vector<int32_t> misses;
     std::vector<uint64_t> token_zero; // [n_tokens] zero slots used by each token
+    size_t n_skipped = 0;             // misses of the last plan() dropped by LLAMA_MOE_TAIL_SKIP
 
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
         GGML_ASSERT(n_class == (int) std::log2(1.0f/(1.0f - std::exp2(-1.0f/crf_half_life))) + 1);
@@ -230,6 +231,50 @@ struct moe_cache_lru {
             }
         }
 
+        // Local experiment, LOSSY, off by default (LLAMA_MOE_TAIL_SKIP=K): a miss that every token of the batch routes at
+        // rank K or lower (0 = the strongest expert) is neither fetched nor computed, it reads as zero like a miss left
+        // to the CPU but nothing computes it. The weakest experts carry the least weight and misses are what cost time
+        // when the experts live off the card. Needs zero slots, so a CPU share above 0 (a tiny one is enough).
+        n_skipped = 0;
+        token_zero.assign(n_tokens, 0);
+        {
+            static const int tail_k = getenv("LLAMA_MOE_TAIL_SKIP") ? atoi(getenv("LLAMA_MOE_TAIL_SKIP")) : 0;
+            if (tail_k > 0 && n_zero > 0 && (size_t) n_tokens*n_used == n_ids) {
+                size_t n_keep = 0;
+                for (size_t i = 0; i < misses.size(); ++i) {
+                    const int32_t e = misses[i];
+                    int32_t  best = n_used;
+                    uint64_t used = 0;
+                    for (int64_t it = 0; it < n_tokens; ++it) {
+                        for (int32_t k = 0; k < n_used; ++k) {
+                            if (ids[it*n_used + k] == e) {
+                                best  = std::min(best, k);
+                                used |= token_zero[it];
+                            }
+                        }
+                    }
+                    int32_t z = 0;
+                    while (z < 64 && (used >> z & 1)) {
+                        z++;
+                    }
+                    if (best < tail_k || z >= n_zero) {
+                        misses[n_keep++] = e;
+                        continue;
+                    }
+                    for (int64_t it = 0; it < n_tokens; ++it) {
+                        for (int32_t k = 0; k < n_used; ++k) {
+                            if (ids[it*n_used + k] == e) {
+                                token_zero[it] |= 1ull << z;
+                            }
+                        }
+                    }
+                    slots[e] = n_slots + z;
+                    n_skipped++;
+                }
+                misses.resize(n_keep);
+            }
+        }
+
         // the misses with the lowest CRF are left to the CPU, a miss that keeps being used gains CRF and enters the cache
         // all misses are used at the same clock, so their CRF compare without decay
         const size_t n_c = std::min(n_cpu(misses.size()), misses.size());
@@ -240,7 +285,6 @@ struct moe_cache_lru {
                 return crf_a != crf_b ? crf_a < crf_b : a < b;
             });
             GGML_ASSERT((size_t) n_tokens*n_used == n_ids);
-            token_zero.assign(n_tokens, 0);
             size_t n_keep = n_c;
             for (size_t i = 0; i < n_keep; ) {
                 const int32_t e = misses[i];
@@ -501,6 +545,7 @@ struct llama_moe_cache::impl {
     };
     std::vector<ram_tier> ram;       // per group
     size_t                ram_hits  = 0;
+    size_t                tail_skipped = 0;
     size_t                ram_reads = 0;
 
     ram_tier & ram_of(ggml_backend_t backend, size_t ig) {
@@ -1237,6 +1282,7 @@ struct llama_moe_cache::impl {
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
         st.misses += fills.size() + cpu.size();
+        tail_skipped += g.lru.n_skipped;
         st.cpu    += cpu.size();
         st.bytes  += bytes;
 
@@ -1247,6 +1293,9 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        if (tail_skipped > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: tail skip: %zu misses neither fetched nor computed\n", tail_skipped);
+        }
         if (stage_reads > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: disk tier: %zu expert tensors read from the file, %.2f MiB; RAM tier: %zu hits\n", stage_reads, stage_bytes/1024.0/1024.0, ram_hits);
         }
