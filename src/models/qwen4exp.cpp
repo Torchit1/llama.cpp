@@ -23,6 +23,16 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
     }
 }
 
+// Logits from an output matrix that holds only a prefix of the vocabulary: lift them above zero and pad with zeros, so
+// the missing tokens rank below every real one and get no probability. A no-op for a full matrix.
+static ggml_tensor * qwen4exp_pad_logits(ggml_context * ctx0, ggml_tensor * logits, int64_t n_vocab) {
+    if (logits->ne[0] >= n_vocab) {
+        return logits;
+    }
+    logits = ggml_scale_bias(ctx0, logits, 1.0f, 200.0f);
+    return ggml_pad(ctx0, logits, (int) (n_vocab - logits->ne[0]), 0, 0, 0);
+}
+
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -190,7 +200,16 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, trunk_flags);
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    // Local experiment: a draft head may carry only the first rows of the output matrix (a prefix of the vocabulary).
+    // The graph then pads the logits back to the full vocabulary, see qwen4exp_pad_logits().
+    int64_t n_out = n_vocab;
+    if (const ggml_tensor * meta = ml.get_tensor_meta(tn(LLM_TENSOR_OUTPUT, "weight").str().c_str())) {
+        if (meta->ne[1] > 0 && meta->ne[1] < n_vocab) {
+            n_out = meta->ne[1];
+            LLAMA_LOG_WARN("%s: output matrix covers the first %lld of %lld tokens\n", __func__, (long long) n_out, (long long) n_vocab);
+        }
+    }
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_out }, TENSOR_NOT_REQUIRED);
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
@@ -570,6 +589,7 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
     res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = qwen4exp_pad_logits(ctx0, cur, (int64_t) model.vocab.n_tokens());
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
@@ -661,6 +681,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
     res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = qwen4exp_pad_logits(ctx0, cur, (int64_t) model.vocab.n_tokens());
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

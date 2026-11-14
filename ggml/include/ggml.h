@@ -745,6 +745,11 @@ extern "C" {
     GGML_API const char * ggml_commit(void);
 
     GGML_API void    ggml_time_init(void); // call this once at the beginning of the program
+
+    // Local test aid: an integer switch that can be changed while the process runs. The value comes from the file named
+    // by the environment variable GGML_SWITCH_FILE (lines NAME=VALUE, re-read when the file changes), else from the
+    // environment variable NAME, else def. Lets one loaded model be measured with a setting on and off.
+    GGML_API int     ggml_live_switch(const char * name, int def);
     GGML_API int64_t ggml_time_ms(void);
     GGML_API int64_t ggml_time_us(void);
     GGML_API int64_t ggml_cycles(void);

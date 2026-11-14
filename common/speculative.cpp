@@ -1849,7 +1849,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // kth drafted token), with its predecessors, so an on-disk per-token table can be read while the drafter runs.
     // SPEC_PREFETCH_TGT=0 turns it off.
     void prefetch_tgt(const common_speculative_draft_params & dp, size_t n_drafted) {
-        static const bool on = getenv("SPEC_PREFETCH_TGT") == nullptr || atoi(getenv("SPEC_PREFETCH_TGT")) != 0;
+        const bool on = ggml_live_switch("SPEC_PREFETCH_TGT", 1) != 0;
         if (!on || !params.ctx_tgt) {
             return;
         }

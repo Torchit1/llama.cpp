@@ -517,6 +517,19 @@ struct ggml_backend_sycl_context {
     optimize_feature opt_feature;
     ggml_sycl_gdn_state_gather gdn_gather;
 
+    // Reuse within one graph compute for the routed experts of a layer: gate and up quantise the same activations, and
+    // gate, up and down build the same window schedule from the same ids. Keyed by the tensor and the graph epoch.
+    struct moe_share_buf {
+        const void * key    = nullptr;
+        uint64_t     epoch  = 0;
+        int          aux    = 0;
+        void *       data   = nullptr;
+        size_t       cap    = 0;
+    };
+    uint64_t      graph_epoch = 0;
+    moe_share_buf moe_q8;
+    moe_share_buf moe_fol;
+
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
     explicit ggml_backend_sycl_context(int device) :

@@ -35,7 +35,7 @@ void ggml_sycl_op_mul_mat_vec_q(
 // Returns false if the type or shape isn't handled; caller should fall back.
 bool ggml_sycl_mul_mat_vec_q_id_window(
     enum ggml_type src0_type, const void * vx_base, const void * vy_base, const int32_t * ids_base,
-    size_t ids_token_stride, int32_t * fol, float * dst_base, int ncols, int nrows, int n_ids, int n_tokens,
+    size_t ids_token_stride, int32_t * fol_build, int32_t * fol, float * dst_base, int ncols, int nrows, int n_ids, int n_tokens,
     size_t expert_weight_stride, size_t dst_row_stride, size_t dst_token_stride, size_t y_row_bytes,
     int y_rows_per_token, dpct::queue_ptr stream);
 

@@ -3182,7 +3182,7 @@ static void launch_mul_mat_vec_grid_moe_window(
 
 bool ggml_sycl_mul_mat_vec_q_id_window(
     enum ggml_type src0_type, const void * vx_base, const void * vy_base, const int32_t * ids_base,
-    size_t ids_token_stride, int32_t * fol, float * dst_base, int ncols, int nrows, int n_ids, int n_tokens,
+    size_t ids_token_stride, int32_t * fol_build, int32_t * fol, float * dst_base, int ncols, int nrows, int n_ids, int n_tokens,
     size_t expert_weight_stride, size_t dst_row_stride, size_t dst_token_stride, size_t y_row_bytes,
     int y_rows_per_token, dpct::queue_ptr stream) {
     const bool grid_type = src0_type == GGML_TYPE_IQ2_S || src0_type == GGML_TYPE_IQ3_XXS || src0_type == GGML_TYPE_IQ3_S;
@@ -3190,7 +3190,9 @@ bool ggml_sycl_mul_mat_vec_q_id_window(
         n_tokens > GGML_SYCL_MOE_WINDOW_MAX_TOKENS || ncols % (grid_type ? QK_K : QK4_NL) != 0) {
         return false;
     }
-    launch_moe_window_schedule(ids_base, ids_token_stride, n_ids, n_tokens, fol, stream);
+    if (fol_build) { // nullptr: fol already holds the schedule for these ids
+        launch_moe_window_schedule(ids_base, ids_token_stride, n_ids, n_tokens, fol_build, stream);
+    }
     const int n_dots   = grid_type ? (ncols / QK_K) * (QK_K / 32) : (ncols / QK4_NL) * (QI4_NL / VDR_IQ4_NL_Q8_1_MMVQ);
     const int row_dots = ggml_sycl_moe_row_dots() > 0 ? ggml_sycl_moe_row_dots() : 20;
     int       lpr      = 1;

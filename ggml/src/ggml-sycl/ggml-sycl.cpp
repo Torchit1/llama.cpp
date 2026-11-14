@@ -5699,6 +5699,28 @@ static bool ggml_sycl_mul_mat_id_should_use_mmvq(const ggml_tensor * dst) {
            ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type);
 }
 
+// A device buffer of at least `bytes` that stays valid until the next request for the same slot. Returns true when the
+// slot already holds the result for (key, aux) from this graph compute, so the caller can skip producing it again.
+// GGML_SYCL_MOE_SHARE=0 turns the reuse off (the buffer is still used, the work is redone).
+static bool ggml_sycl_moe_share_get(ggml_backend_sycl_context & ctx, ggml_backend_sycl_context::moe_share_buf & b,
+                                    const void * key, int aux, size_t bytes, void ** out) {
+    if (b.cap < bytes) {
+        ctx.stream()->wait(); // nothing queued may still read the old buffer
+        if (b.data) {
+            sycl::free(b.data, *ctx.stream());
+        }
+        b.cap  = bytes + bytes / 4;
+        b.data = sycl::malloc_device(b.cap, *ctx.stream());
+        b.key  = nullptr;
+    }
+    *out = b.data;
+    const bool hit = b.key == key && b.epoch == ctx.graph_epoch && b.aux == aux && ggml_live_switch("GGML_SYCL_MOE_SHARE", 1) != 0;
+    b.key   = key;
+    b.epoch = ctx.graph_epoch;
+    b.aux   = aux;
+    return hit;
+}
+
 // Fused MoE TG fast path. Returns false to fall back to the per-expert loop below.
 static bool ggml_sycl_mul_mat_id_mmvq_fused(
     ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
@@ -5722,10 +5744,14 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
 
-    ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
-        (size_t) ne11 * ne12 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
-    char * src1_ddq = src1_q8_alloc.get();
-    if (use_reorder) {
+    // gate and up of a layer read the same activations: the second one reuses the first one's quantised copy
+    void *     src1_q8_buf = nullptr;
+    const bool q8_hit      = ggml_sycl_moe_share_get(ctx, ctx.moe_q8, src1, use_reorder ? 1 : 0,
+                                                     (size_t) ne11 * ne12 * src1_padded_cols * sizeof(block_q8_1) / QK8_1, &src1_q8_buf);
+    char * src1_ddq = (char *) src1_q8_buf;
+    if (q8_hit) {
+        // already quantised in this graph compute
+    } else if (use_reorder) {
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
             (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
             src1_padded_cols, stream);
@@ -5740,14 +5766,18 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
 
     if (!use_reorder && ne12 > 1) {
         // whole window in one launch, shared experts decoded once
-        ggml_sycl_pool_alloc<int32_t> fol(ctx.pool(), (size_t) n_experts_used * ne12 * ne12);
+        // gate, up and down of a layer route by the same ids: the schedule is built once
+        void *     fol_buf = nullptr;
+        const bool fol_hit = ggml_sycl_moe_share_get(ctx, ctx.moe_fol, ids, (int) (n_experts_used * 64 + ne12),
+                                                     (size_t) n_experts_used * ne12 * ne12 * sizeof(int32_t), &fol_buf);
         if (ggml_sycl_mul_mat_vec_q_id_window(
-                src0->type, src0->data, src1_ddq, (const int32_t *) ids->data, ids->nb[1], fol.get(),
+                src0->type, src0->data, src1_ddq, (const int32_t *) ids->data, ids->nb[1], fol_hit ? nullptr : (int32_t *) fol_buf, (int32_t *) fol_buf,
                 (float *) dst->data, (int) ne10, nrows, n_experts_used, (int) ne12,
                 /*expert_weight_stride=*/ src0->nb[2], /*dst_row_stride=*/ dst->nb[1], /*dst_token_stride=*/ dst->nb[2],
                 bytes_per_qrow, (int) ne11, stream)) {
             return true;
         }
+        ctx.moe_fol.key = nullptr; // the window kernel did not take the call, so no schedule was built
     }
 
     // one launch per token: the ids and dst rows of a token are contiguous, consecutive tokens need not be
@@ -6800,8 +6830,8 @@ struct ggml_sycl_bf16_post_match {
     int                 last_idx = 0;
 };
 
-static bool ggml_sycl_match_bf16_post(const ggml_cgraph * cgraph, int i, ggml_sycl_bf16_post_match & m) {
-    static const bool post_on = getenv("GGML_SYCL_FUSE_BF16_POST") == nullptr || atoi(getenv("GGML_SYCL_FUSE_BF16_POST")) != 0;
+static bool ggml_sycl_match_bf16_post(const ggml_cgraph * cgraph, int i, ggml_sycl_bf16_post_match & m, int first_pat = -1) {
+    const bool post_on = first_pat >= 0 ? first_pat == 0 : ggml_live_switch("GGML_SYCL_FUSE_BF16_POST", 1) != 0;
     const ggml_tensor * mm = cgraph->nodes[i];
     if (mm->op != GGML_OP_MUL_MAT || !g_ggml_sycl_enable_fusion) {
         return false;
@@ -6870,8 +6900,7 @@ struct ggml_sycl_moe_sum_match {
 };
 
 static bool ggml_sycl_fuse_moe_sum() {
-    static const bool on = getenv("GGML_SYCL_FUSE_MOE_SUM") == nullptr || atoi(getenv("GGML_SYCL_FUSE_MOE_SUM")) != 0;
-    return on;
+    return ggml_live_switch("GGML_SYCL_FUSE_MOE_SUM", 1) != 0;
 }
 
 static bool ggml_sycl_match_moe_sum(const ggml_cgraph * cgraph, int i, ggml_sycl_moe_sum_match & m) {
@@ -6945,6 +6974,7 @@ static void ggml_sycl_op_moe_sum(ggml_backend_sycl_context & ctx, const ggml_syc
 }
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+    sycl_ctx->graph_epoch++;
     sycl_ctx->gdn_gather = {};
     const auto gdn_gathers = ggml_sycl_match_gdn_state_gathers(cgraph);
     ggml_sycl_conv_window_match conv_window;
@@ -7530,16 +7560,21 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
     if (ggml_sycl_fuse_bf16_mul_mat_scale()) {
         for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
-            ggml_sycl_bf16_post_match m;
-            if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT || !ggml_sycl_match_bf16_post(cgraph, i, m)) {
+            if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
                 continue;
             }
             // the fused kernel writes the last node's output while it reads the activations, which must not share memory
-            ggml_tensor * x = cgraph->nodes[i]->src[1];
-            params->add_alloc_dep(params->user_data, x->view_src ? x->view_src : x, m.out);
+            // both the long and the short pattern, since the switch between them can change while the allocation is reused
+            for (int first_pat : { 0, 3 }) {
+                ggml_sycl_bf16_post_match m;
+                if (ggml_sycl_match_bf16_post(cgraph, i, m, first_pat)) {
+                    ggml_tensor * x = cgraph->nodes[i]->src[1];
+                    params->add_alloc_dep(params->user_data, x->view_src ? x->view_src : x, m.out);
+                }
+            }
         }
     }
-    if (ggml_sycl_fuse_moe_sum()) {
+    {   // always: the switch can change while the graph's allocation is reused
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_sycl_moe_sum_match m;
             if (cgraph->nodes[i]->op != GGML_OP_MUL || !ggml_sycl_match_moe_sum(cgraph, i, m)) {
