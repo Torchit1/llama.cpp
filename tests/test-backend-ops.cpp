@@ -13646,6 +13646,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // LoRA at prefill: B is [rank, n_out], so K = rank
+    // local: the vocabulary (output) matrix of Qwen3.8-Flash-Next, 248,320 x 2,560 Q6_K, for 1..4 positions (decode and an
+    // MTP verify window), and the 100,000-row prefix a draft head can use
+    for (int n : { 1, 2, 4 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 2560, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 100000, 1, 2560, {1, 1}, {1, 1}));
+
     for (int64_t k : {16, 32, 48, 64}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 2048, 512, k, {1, 1}, {1, 1}));
     }

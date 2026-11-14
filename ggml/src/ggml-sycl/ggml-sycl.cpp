@@ -6891,6 +6891,56 @@ static bool ggml_sycl_match_bf16_post(const ggml_cgraph * cgraph, int i, ggml_sy
     return false;
 }
 
+// MUL then ADD on F32 tensors of one shape [n, T]: out = x * g + c in one launch, where g has the shape of x or is one
+// value per column ([1, T], the shared-expert gate). GGML_SYCL_FUSE_MUL_ADD=0 turns it off.
+struct ggml_sycl_mul_add_match {
+    const ggml_tensor * x = nullptr;
+    const ggml_tensor * g = nullptr;
+    const ggml_tensor * c = nullptr;
+    ggml_tensor *       out = nullptr;
+};
+
+static bool ggml_sycl_match_mul_add(const ggml_cgraph * cgraph, int i, ggml_sycl_mul_add_match & m) {
+    static const ggml_op ops[2] = { GGML_OP_MUL, GGML_OP_ADD };
+    if (!g_ggml_sycl_enable_fusion || !ggml_can_fuse(cgraph, i, ops, 2)) {
+        return false;
+    }
+    const ggml_tensor * mul = cgraph->nodes[i];
+    ggml_tensor *       add = cgraph->nodes[i + 1];
+    if (mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || mul->ne[2] != 1 || mul->ne[3] != 1 || !ggml_is_contiguous(add)) {
+        return false;
+    }
+    const ggml_tensor * c = add->src[0] == mul ? add->src[1] : add->src[0];
+    if ((add->src[0] != mul && add->src[1] != mul) || c == mul || c->type != GGML_TYPE_F32 || !ggml_are_same_shape(c, add) || !ggml_is_contiguous(c)) {
+        return false;
+    }
+    for (int k = 0; k < 2; k++) {
+        const ggml_tensor * x  = mul->src[k];
+        const ggml_tensor * gt = mul->src[1 - k];
+        const bool g_ok = ggml_are_same_shape(gt, mul) || (gt->ne[0] == 1 && gt->ne[1] == mul->ne[1] && gt->ne[2] == 1 && gt->ne[3] == 1);
+        if (x->type == GGML_TYPE_F32 && gt->type == GGML_TYPE_F32 && ggml_are_same_shape(x, mul) && g_ok && ggml_is_contiguous(x) &&
+            ggml_is_contiguous(gt)) {
+            m.x = x; m.g = gt; m.c = c; m.out = add;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ggml_sycl_op_mul_add(ggml_backend_sycl_context & ctx, const ggml_sycl_mul_add_match & m) {
+    const float * x   = (const float *) m.x->data;
+    const float * gd  = (const float *) m.g->data;
+    const float * c   = (const float *) m.c->data;
+    float *       out = (float *) m.out->data;
+    const size_t  n   = (size_t) m.out->ne[0];
+    const size_t  T   = (size_t) m.out->ne[1];
+    const bool    per_col = m.g->ne[0] == 1 && n != 1;
+    ctx.stream()->parallel_for(sycl::range<1>(n * T), [=](sycl::id<1> id) {
+        const size_t i = id[0];
+        out[i] = x[i] * (per_col ? gd[i / n] : gd[i]) + c[i];
+    });
+}
+
 // Weighted sum of the routed experts: MUL(experts [n, E, T], weights [1, E, T]) -> E views -> chain of E-1 ADDs.
 // One kernel replaces the multiply and the adds. GGML_SYCL_FUSE_MOE_SUM=0 turns it off.
 struct ggml_sycl_moe_sum_match {
@@ -6978,7 +7028,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     sycl_ctx->gdn_gather = {};
     const auto gdn_gathers = ggml_sycl_match_gdn_state_gathers(cgraph);
     ggml_sycl_conv_window_match conv_window;
-    static const bool hopt = getenv("GGML_SYCL_HOST_OPTIME") != nullptr; // local host-time probe (time between node starts, by op)
+    // local host-time probe (time between node starts, by op), for the graph size class the variable selects
+    static const int  hsel = getenv("GGML_SYCL_HOST_OPTIME") ? atoi(getenv("GGML_SYCL_HOST_OPTIME")) : 0;
+    const bool        hopt = hsel > 1 ? (cgraph->n_nodes >= hsel && cgraph->n_nodes < 1000) : (hsel == 1 && cgraph->n_nodes > 1000);
     static int64_t hacc[GGML_OP_COUNT]; static int64_t hcnt[GGML_OP_COUNT]; static int hgraphs = 0;
     static int64_t hpre = 0, hpre_n = 0; // time from node start to the plain compute_forward call (fusion checks)
     int64_t ht = 0; int hop = -1;
@@ -7030,6 +7082,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 
+        if (node->op == GGML_OP_MUL && ggml_live_switch("GGML_SYCL_FUSE_MUL_ADD", 1) != 0) {
+            ggml_sycl_mul_add_match mul_add;
+            if (ggml_sycl_match_mul_add(cgraph, i, mul_add)) {
+                ggml_sycl_op_mul_add(*sycl_ctx, mul_add);
+                i++;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_MUL && ggml_sycl_fuse_moe_sum()) {
             ggml_sycl_moe_sum_match moe_sum;
             if (ggml_sycl_match_moe_sum(cgraph, i, moe_sum)) {
@@ -7161,9 +7221,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     if (hopt) { // local host-time probe: print the per-op table every 300 large graphs
         const int64_t now = ggml_time_us();
         if (hop >= 0) { hacc[hop] += now - ht; hcnt[hop]++; }
-        if (cgraph->n_nodes > 1000 && ++hgraphs == 300) {
+        // GGML_SYCL_HOST_OPTIME=1: graphs of more than 1000 nodes (the main model); =N (N > 1): graphs of N..999 nodes (a draft head)
+        if (++hgraphs == 300) {
             int64_t tot = 0; for (int o = 0; o < GGML_OP_COUNT; o++) { tot += hacc[o]; }
-            fprintf(stderr, "HOSTOP total %.2f ms per graph\n", tot / 1000.0 / hgraphs);
+            fprintf(stderr, "HOSTOP total %.2f ms per graph (%d nodes)\n", tot / 1000.0 / hgraphs, cgraph->n_nodes);
             fprintf(stderr, "HOSTOP pre-dispatch %.3f ms per graph over %.0f nodes\n", hpre / 1000.0 / hgraphs, (double) hpre_n / hgraphs); hpre = 0; hpre_n = 0;
             for (int o = 0; o < GGML_OP_COUNT; o++) {
                 if (hcnt[o]) { fprintf(stderr, "HOSTOP %-18s %7.1f nodes %7.3f ms %6.2f us\n", ggml_op_name((ggml_op) o), (double) hcnt[o] / hgraphs, hacc[o] / 1000.0 / hgraphs, (double) hacc[o] / hcnt[o]); }
@@ -7572,6 +7633,16 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     params->add_alloc_dep(params->user_data, x->view_src ? x->view_src : x, m.out);
                 }
             }
+        }
+    }
+    for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
+        // the fused multiply-add writes its output while it reads all three inputs
+        ggml_sycl_mul_add_match m;
+        if (cgraph->nodes[i]->op != GGML_OP_MUL || !ggml_sycl_match_mul_add(cgraph, i, m)) {
+            continue;
+        }
+        for (const ggml_tensor * t : { m.x, m.g, m.c }) {
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(t->view_src ? t->view_src : t), m.out);
         }
     }
     {   // always: the switch can change while the graph's allocation is reused
