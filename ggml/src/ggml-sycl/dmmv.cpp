@@ -1997,12 +1997,23 @@ static void launch_mul_mat_vec_bf16_sycl_esimd(const void * vx, const float * y,
     }
 }
 
+// Scale, optional SiLU / sigmoid, then a second scale and bias, applied to one result inside the ESIMD kernel.
+static ESIMD_INLINE float bf16_post_apply(float sum, const ggml_sycl_bf16_post & p) SYCL_ESIMD_FUNCTION {
+    float v = sum * p.scale;
+    if (p.act != 0) {
+        const sycl::ext::intel::esimd::simd<float, 8> e = sycl::ext::intel::esimd::exp(sycl::ext::intel::esimd::simd<float, 8>(-v));
+        const float sg = 1.0f / (1.0f + (float) e[0]);
+        v = p.act == 1 ? v * sg : sg;
+    }
+    return v * p.scale2 + p.bias2;
+}
+
 // The same kernel for NC activation columns (a step of a few tokens): a row's weights are read and widened once
 // and applied to every column.
 template <int WG, int NC>
 static void mul_mat_vec_bf16_sycl_esimd_ncols(const void * vx, const float * y, float * dst, const int ncols,
                                               const int nrows, const size_t y_stride, const size_t dst_stride,
-                                              const float out_scale, dpct::queue_ptr stream) {
+                                              const ggml_sycl_bf16_post out_scale, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % 64 == 0);
     const int nchunks = ncols / 64;
     stream->submit([&](sycl::handler & h) {
@@ -2036,7 +2047,7 @@ static void mul_mat_vec_bf16_sycl_esimd_ncols(const void * vx, const float * y, 
                 if (WG == 1) {
 #pragma unroll
                     for (int e = 0; e < NC; ++e) {
-                        dst[(size_t) e * dst_stride + row] = reduce<float>(acc[e], std::plus<>{}) * out_scale;
+                        dst[(size_t) e * dst_stride + row] = bf16_post_apply(reduce<float>(acc[e], std::plus<>{}), out_scale);
                     }
                     return;
                 }
@@ -2052,7 +2063,7 @@ static void mul_mat_vec_bf16_sycl_esimd_ncols(const void * vx, const float * y, 
                         for (int p = 0; p < WG; ++p) {
                             sum += lmem[p * NC + e];
                         }
-                        dst[(size_t) e * dst_stride + row] = sum * out_scale;
+                        dst[(size_t) e * dst_stride + row] = bf16_post_apply(sum, out_scale);
                     }
                 }
             });
@@ -2062,7 +2073,7 @@ static void mul_mat_vec_bf16_sycl_esimd_ncols(const void * vx, const float * y, 
 template <int NC>
 static void launch_mul_mat_vec_bf16_sycl_esimd_ncols(const void * vx, const float * y, float * dst, const int ncols,
                                                      const int nrows, const size_t y_stride, const size_t dst_stride,
-                                                     const float out_scale, dpct::queue_ptr stream) {
+                                                     const ggml_sycl_bf16_post out_scale, dpct::queue_ptr stream) {
     const int nchunks = ncols / 64;
     int wg = 1;
     while (wg < 32 && wg * 2 <= nchunks && (int64_t) nrows * wg < 4096) {
@@ -2083,7 +2094,7 @@ static void launch_mul_mat_vec_bf16_sycl_esimd_ncols(const void * vx, const floa
 // Returns false when it does not take the call.
 bool ggml_sycl_mul_mat_bf16_ncols_esimd(const void * vx, const float * y, float * dst, int ncols, int nrows,
                                         int n_cols_dst, size_t y_stride, size_t dst_stride, dpct::queue_ptr stream,
-                                        float out_scale, int min_cols) {
+                                        ggml_sycl_bf16_post out_scale, int min_cols) {
     static const int max_cols = [] { const char * e = getenv("GGML_SYCL_BF16_ESIMD_NCOLS"); return e ? atoi(e) : 8; }();
     if (!g_ggml_sycl_enable_esimd || !ggml_sycl_bf16_esimd_enabled() || n_cols_dst < min_cols || n_cols_dst > max_cols ||
         n_cols_dst > 8 || ncols % 64 != 0) {

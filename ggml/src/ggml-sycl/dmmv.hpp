@@ -35,8 +35,17 @@ bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(
 
 // BF16 weights (row major, ncols per row) against 2..8 F32 activation columns, ESIMD. y_stride and dst_stride are
 // in floats. Returns false when the kernel is unavailable, switched off or the shape is not taken.
+// What the BF16 mat-vec kernel does to each result before storing it: v = sum * scale; act 1 = v * sigmoid(v) (SiLU),
+// act 2 = sigmoid(v); then v * scale2 + bias2.
+struct ggml_sycl_bf16_post {
+    float scale  = 1.0f;
+    int   act    = 0;
+    float scale2 = 1.0f;
+    float bias2  = 0.0f;
+};
+
 bool ggml_sycl_mul_mat_bf16_ncols_esimd(const void * vx, const float * y, float * dst, int ncols, int nrows,
                                         int n_cols_dst, size_t y_stride, size_t dst_stride, dpct::queue_ptr stream,
-                                        float out_scale = 1.0f, int min_cols = 2);
+                                        ggml_sycl_bf16_post out_scale = {}, int min_cols = 2);
 
 #endif // GGML_SYCL_DMMV_HPP

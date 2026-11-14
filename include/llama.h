@@ -1005,6 +1005,10 @@ extern "C" {
     //    2 - aborted     (processed ubatches will remain in the context's memory)
     //   -1 - invalid input batch
     // < -1 - fatal error (processed ubatches will remain in the context's memory)
+    // Local experiment: hint that the last token of `window` (oldest first) will be decoded after the tokens before it,
+    // so a model with an on-disk per-token table can start reading its rows now. No-op for other models.
+    LLAMA_API void llama_model_prefetch_token(const struct llama_model * model, const llama_token * window, int32_t n_window);
+
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);

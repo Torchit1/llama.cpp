@@ -6791,6 +6791,76 @@ static bool ggml_sycl_fuse_bf16_mul_mat_scale() {
     return on;
 }
 
+// BF16 mat-vec followed by a scale and/or SiLU / sigmoid (and a second scale): the mat-vec kernel does it all in one
+// launch. Patterns, longest first: MUL_MAT SCALE UNARY SCALE | MUL_MAT SCALE UNARY | MUL_MAT UNARY | MUL_MAT SCALE.
+// GGML_SYCL_FUSE_BF16_POST=0 keeps only MUL_MAT SCALE.
+struct ggml_sycl_bf16_post_match {
+    ggml_sycl_bf16_post post;
+    ggml_tensor *       out      = nullptr;
+    int                 last_idx = 0;
+};
+
+static bool ggml_sycl_match_bf16_post(const ggml_cgraph * cgraph, int i, ggml_sycl_bf16_post_match & m) {
+    static const bool post_on = getenv("GGML_SYCL_FUSE_BF16_POST") == nullptr || atoi(getenv("GGML_SYCL_FUSE_BF16_POST")) != 0;
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (mm->op != GGML_OP_MUL_MAT || !g_ggml_sycl_enable_fusion) {
+        return false;
+    }
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * x = mm->src[1];
+    if (w->type != GGML_TYPE_BF16 || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
+        !ggml_is_contiguous(x) || w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[1] < 1 || x->ne[1] > 8 ||
+        w->ne[0] % 64 != 0 || x->ne[0] != w->ne[0] || ggml_backend_buffer_is_sycl_split(w->buffer)) {
+        return false;
+    }
+    static const ggml_op pat[4][4] = {
+        { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE },
+        { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_NONE },
+        { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_NONE, GGML_OP_NONE },
+        { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_NONE, GGML_OP_NONE },
+    };
+    static const int pat_n[4] = { 4, 3, 2, 2 };
+    for (int p = post_on ? 0 : 3; p < 4; p++) {
+        const int n = pat_n[p];
+        if (!ggml_can_fuse(cgraph, i, pat[p], n)) {
+            continue;
+        }
+        ggml_sycl_bf16_post post;
+        bool                ok    = true;
+        int                 stage = 0; // 0: before the activation, 1: after it
+        for (int k = 1; k < n && ok; k++) {
+            const ggml_tensor * t = cgraph->nodes[i + k];
+            if (t->src[0] != cgraph->nodes[i + k - 1] || t->type != GGML_TYPE_F32) {
+                ok = false;
+            } else if (t->op == GGML_OP_UNARY) {
+                const ggml_unary_op u = ggml_get_unary_op(t);
+                post.act = u == GGML_UNARY_OP_SILU ? 1 : u == GGML_UNARY_OP_SIGMOID ? 2 : 0;
+                ok       = post.act != 0;
+                stage    = 1;
+            } else { // SCALE
+                float sc, bias;
+                memcpy(&sc, (const float *) t->op_params + 0, sizeof(float));
+                memcpy(&bias, (const float *) t->op_params + 1, sizeof(float));
+                if (stage == 0) {
+                    post.scale = sc;
+                    ok         = bias == 0.0f;
+                } else {
+                    post.scale2 = sc;
+                    post.bias2  = bias;
+                }
+            }
+        }
+        if (!ok || !ggml_is_contiguous(cgraph->nodes[i + n - 1])) {
+            continue;
+        }
+        m.post     = post;
+        m.last_idx = i + n - 1;
+        m.out      = cgraph->nodes[m.last_idx];
+        return true;
+    }
+    return false;
+}
+
 // Weighted sum of the routed experts: MUL(experts [n, E, T], weights [1, E, T]) -> E views -> chain of E-1 ADDs.
 // One kernel replaces the multiply and the adds. GGML_SYCL_FUSE_MOE_SUM=0 turns it off.
 struct ggml_sycl_moe_sum_match {
@@ -6981,17 +7051,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         // qwen35 GDN l2 norms are emitted as rms_norm + scalar scale (models.h
         // build_gdn_l2_norm), which the rms_norm+mul fusion above cannot match
-        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_fuse_bf16_mul_mat_scale() &&
-            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_SCALE }, {}) &&
-            !ggml_backend_buffer_is_sycl_split(node->src[0]->buffer)) {
-            ggml_tensor * scale = cgraph->nodes[i + 1];
-            float         factor;
-            memcpy(&factor, (const float *) scale->op_params, sizeof(float));
-            if (ggml_sycl_mul_mat_bf16_ncols_esimd(node->src[0]->data, (const float *) node->src[1]->data,
-                                                   (float *) scale->data, (int) node->src[0]->ne[0], (int) node->src[0]->ne[1],
+        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_fuse_bf16_mul_mat_scale()) {
+            ggml_sycl_bf16_post_match bf16_post;
+            if (ggml_sycl_match_bf16_post(cgraph, i, bf16_post) &&
+                ggml_sycl_mul_mat_bf16_ncols_esimd(node->src[0]->data, (const float *) node->src[1]->data,
+                                                   (float *) bf16_post.out->data, (int) node->src[0]->ne[0], (int) node->src[0]->ne[1],
                                                    (int) node->src[1]->ne[1], (size_t) node->src[1]->ne[0],
-                                                   (size_t) scale->ne[0], sycl_ctx->stream(), factor, /*min_cols=*/ 1)) {
-                i++;
+                                                   (size_t) bf16_post.out->ne[0], sycl_ctx->stream(), bf16_post.post, /*min_cols=*/ 1)) {
+                i = bf16_post.last_idx;
                 continue;
             }
         }
@@ -7463,13 +7530,13 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
     if (ggml_sycl_fuse_bf16_mul_mat_scale()) {
         for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
-            ggml_tensor * mm = cgraph->nodes[i];
-            if (mm->op != GGML_OP_MUL_MAT || !ggml_sycl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_SCALE }, {})) {
+            ggml_sycl_bf16_post_match m;
+            if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT || !ggml_sycl_match_bf16_post(cgraph, i, m)) {
                 continue;
             }
-            // the fused kernel writes the scale output while it reads the activations, which must not share memory
-            ggml_tensor * x = mm->src[1];
-            params->add_alloc_dep(params->user_data, x->view_src ? x->view_src : x, cgraph->nodes[i + 1]);
+            // the fused kernel writes the last node's output while it reads the activations, which must not share memory
+            ggml_tensor * x = cgraph->nodes[i]->src[1];
+            params->add_alloc_dep(params->user_data, x->view_src ? x->view_src : x, m.out);
         }
     }
     if (ggml_sycl_fuse_moe_sum()) {

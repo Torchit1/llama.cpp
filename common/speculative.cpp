@@ -1845,6 +1845,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    // Hint the target model about the token the next verify batch will hold at position n_drafted (0 = id_last, k = the
+    // kth drafted token), with its predecessors, so an on-disk per-token table can be read while the drafter runs.
+    // SPEC_PREFETCH_TGT=0 turns it off.
+    void prefetch_tgt(const common_speculative_draft_params & dp, size_t n_drafted) {
+        static const bool on = getenv("SPEC_PREFETCH_TGT") == nullptr || atoi(getenv("SPEC_PREFETCH_TGT")) != 0;
+        if (!on || !params.ctx_tgt) {
+            return;
+        }
+        llama_token  window[16];
+        int32_t      n      = 0;
+        const size_t n_hist = dp.prompt ? std::min<size_t>(dp.prompt->size(), 16 - 1 - n_drafted) : 0;
+        for (size_t i = 0; i < n_hist; i++) {
+            window[n++] = (*dp.prompt)[dp.prompt->size() - n_hist + i];
+        }
+        window[n++] = dp.id_last;
+        for (size_t i = 0; i < n_drafted && dp.result && n < 16; i++) {
+            window[n++] = (*dp.result)[i];
+        }
+        llama_model_prefetch_token(llama_get_model(params.ctx_tgt), window, n);
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
@@ -1877,6 +1898,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!dp.result_q) {
                 common_sampler_reset(smpls[seq_id].get());
             }
+
+            // start the target's table reads for the sampled token now; the drafted tokens follow as they are produced
+            prefetch_tgt(dp, 0);
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
@@ -1953,6 +1977,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                prefetch_tgt(dp, result.size());
 
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);

@@ -1296,6 +1296,47 @@ public:
     std::vector<llama_token> prev;
 };
 
+// Ask the OS to read the n-gram table rows that `window[n_window - 1]` will need when it is decoded after the tokens
+// before it in `window` (oldest first). Used by the MTP drafter: the tokens of the next verify batch are known a few
+// milliseconds before it is decoded, so the disk reads can overlap the drafting. A no-op for models without the table.
+void llama_model_prefetch_token(const llama_model * model, const llama_token * window, int32_t n_window) {
+    if (!model || n_window < 1) {
+        return;
+    }
+    const auto &        hparams = model->hparams;
+    const ggml_tensor * ple     = model->per_layer_tok_embd;
+    if (!ple || !model->can_prefetch.count(ple) || hparams.ple_ngram_size < 2 || hparams.ple_n_heads < 1) {
+        return;
+    }
+    const int64_t n_gram   = hparams.ple_ngram_size;
+    const int64_t n_heads  = hparams.ple_n_heads;
+    const int64_t per_gram = hparams.ple_heads_per_ngram;
+    const int64_t eos      = hparams.ple_eos_token_id;
+
+    // same context rule as set_input(): an EOS, or a missing predecessor, cuts everything at or before it
+    std::vector<int64_t> ctx(n_gram);
+    ctx[0]   = window[n_window - 1];
+    bool cut = false;
+    for (int64_t s = 1; s < n_gram; ++s) {
+        const llama_token t = (cut || n_window - 1 - s < 0) ? LLAMA_TOKEN_NULL : window[n_window - 1 - s];
+        cut = cut || t < 0 || t == eos;
+        ctx[s] = cut ? eos : t;
+    }
+    std::vector<int32_t> idx(n_heads);
+    for (int64_t n = 2; n <= n_gram; ++n) {
+        uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
+        for (int64_t j = 1; j < n; ++j) {
+            mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
+        }
+        const int64_t base = (n - 2) * per_gram;
+        for (int64_t g = 0; g < per_gram; ++g) {
+            const int64_t h_i = base + g;
+            idx[h_i] = (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
+        }
+    }
+    llama_prefetch_rows(ple, idx.data(), idx.size());
+}
+
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hparams = model.hparams;
 
