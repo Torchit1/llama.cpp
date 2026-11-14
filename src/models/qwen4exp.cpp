@@ -1,5 +1,10 @@
 #include "models.h"
 #include "llama-impl.h"
+
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
@@ -1317,6 +1322,51 @@ public:
     std::vector<llama_token> prev;
 };
 
+// A few helper threads that read memory ranges (one byte per page), used to pull table rows into the page cache.
+struct qwen4exp_touch_pool {
+    std::mutex                                 mtx;
+    std::condition_variable                    cv;
+    std::deque<std::pair<const char *, size_t>> q;
+    std::vector<std::thread>                   workers;
+
+    static qwen4exp_touch_pool & instance() {
+        static qwen4exp_touch_pool * p = new qwen4exp_touch_pool(); // never destroyed: the threads live with the process
+        return *p;
+    }
+    qwen4exp_touch_pool() {
+        for (int i = 0; i < 8; i++) {
+            workers.emplace_back([this] {
+                for (;;) {
+                    std::pair<const char *, size_t> job;
+                    {
+                        std::unique_lock<std::mutex> lock(mtx);
+                        cv.wait(lock, [this] { return !q.empty(); });
+                        job = q.front();
+                        q.pop_front();
+                    }
+                    volatile char sink = 0;
+                    const char *  end  = job.first + job.second;
+                    for (const char * p = job.first; p < end; p += 4096) {
+                        sink = sink + *p;
+                    }
+                    sink = sink + *(end - 1);
+                }
+            });
+            workers.back().detach();
+        }
+    }
+    void push(const char * addr, size_t len) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (q.size() > 4096) {
+                return; // far behind: drop, the decode will fault the pages in as before
+            }
+            q.emplace_back(addr, len);
+        }
+        cv.notify_one();
+    }
+};
+
 // Ask the OS to read the n-gram table rows that `window[n_window - 1]` will need when it is decoded after the tokens
 // before it in `window` (oldest first). Used by the MTP drafter: the tokens of the next verify batch are known a few
 // milliseconds before it is decoded, so the disk reads can overlap the drafting. A no-op for models without the table.
@@ -1356,6 +1406,15 @@ void llama_model_prefetch_token(const llama_model * model, const llama_token * w
         }
     }
     llama_prefetch_rows(ple, idx.data(), idx.size());
+
+    // the hint above is advisory and the kernel may drop it or be late: helper threads also read the rows, so a page
+    // that is not in memory is fetched by them, in parallel, and not by the decode thread. Off by default (no gain measured on the B70 box), LLAMA_PREFETCH_TOUCH=1 turns it on.
+    if (ggml_live_switch("LLAMA_PREFETCH_TOUCH", 0) != 0 && ple->data && ggml_backend_buffer_is_host(ple->buffer)) {
+        const size_t row_bytes = ggml_row_size(ple->type, ple->ne[0]);
+        for (const int32_t r : idx) {
+            qwen4exp_touch_pool::instance().push((const char *) ple->data + (size_t) r * ple->nb[1], row_bytes);
+        }
+    }
 }
 
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
