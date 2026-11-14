@@ -1,4 +1,8 @@
 #include "fusion.hpp"
+
+#include <mutex>
+#include <set>
+#include <string>
 #include "binbcast.hpp"
 
 #include <algorithm>
@@ -97,6 +101,28 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
 
     if (!g_ggml_sycl_enable_fusion) {
         return false;
+    }
+
+    {   // local bisection aid: each fusion pattern can be switched off live with NOFUSE_<OP>+<OP>...=1 (GGML_SWITCH_FILE);
+        // the patterns seen are printed once as FUSEKEY lines
+        static std::mutex            key_mtx;
+        static std::set<std::string> key_seen;
+        std::string key = "NOFUSE_";
+        for (const ggml_op op : ops) {
+            if (key.size() > 7) {
+                key += "+";
+            }
+            key += ggml_op_name(op);
+        }
+        {
+            std::lock_guard<std::mutex> lock(key_mtx);
+            if (key_seen.insert(key).second) {
+                fprintf(stderr, "FUSEKEY %s\n", key.c_str());
+            }
+        }
+        if (ggml_live_switch(key.c_str(), 0) != 0) {
+            return false;
+        }
     }
 
     // gate and up are siblings, not a chain, so ggml_can_fuse cannot express this: use the

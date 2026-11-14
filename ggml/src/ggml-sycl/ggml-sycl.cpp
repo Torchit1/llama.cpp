@@ -6748,7 +6748,7 @@ catch (sycl::exception const &exc) {
 // ported from ggml_cuda_try_gdn_cache_fusion - pure graph inspection, backend-agnostic
 static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_idx,
                                           ggml_sycl_gated_delta_net_fused_cache & fused_state_cpy) {
-    if (!g_ggml_sycl_enable_fusion) {
+    if (!g_ggml_sycl_enable_fusion || ggml_live_switch("NOFUSE_GDN_CACHE", 0) != 0) { // NOFUSE_GDN_CACHE: local bisection aid
         return 0;
     }
 
@@ -7222,7 +7222,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         const int64_t now = ggml_time_us();
         if (hop >= 0) { hacc[hop] += now - ht; hcnt[hop]++; }
         // GGML_SYCL_HOST_OPTIME=1: graphs of more than 1000 nodes (the main model); =N (N > 1): graphs of N..999 nodes (a draft head)
-        if (++hgraphs == 300) {
+        static const int hevery = getenv("GGML_SYCL_HOST_OPTIME_N") ? atoi(getenv("GGML_SYCL_HOST_OPTIME_N")) : 300;
+        if (++hgraphs == hevery) {
             int64_t tot = 0; for (int o = 0; o < GGML_OP_COUNT; o++) { tot += hacc[o]; }
             fprintf(stderr, "HOSTOP total %.2f ms per graph (%d nodes)\n", tot / 1000.0 / hgraphs, cgraph->n_nodes);
             fprintf(stderr, "HOSTOP pre-dispatch %.3f ms per graph over %.0f nodes\n", hpre / 1000.0 / hgraphs, (double) hpre_n / hgraphs); hpre = 0; hpre_n = 0;

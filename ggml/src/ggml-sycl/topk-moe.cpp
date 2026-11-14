@@ -560,7 +560,7 @@ bool ggml_sycl_topk_moe_io(const ggml_cgraph * cgraph, int i, ggml_tensor ** log
 }
 
 int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
-    if (!g_ggml_sycl_enable_fusion) {
+    if (!g_ggml_sycl_enable_fusion || ggml_live_switch("NOFUSE_TOPK", 0) != 0) { // NOFUSE_TOPK: local bisection aid
         return 0;
     }
 

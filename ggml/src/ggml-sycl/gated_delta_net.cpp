@@ -35,6 +35,8 @@ static void launch_gated_delta_net_esimd(const float *   q,
                                          float           scale,
                                          int64_t         state_slot_stride,
                                          int             K,
+                                         const int32_t * s_ids,
+                                         int64_t         s_row_stride,
                                          dpct::queue_ptr stream) {
     constexpr int S_v = 128;
     stream->parallel_for(
@@ -48,7 +50,9 @@ static void launch_gated_delta_net_esimd(const float *   q,
             const int iq3      = sequence / (int) rq3;
 
             const int64_t    head      = sequence * H + h_idx;
-            simd<float, S_v> s         = block_load<float, S_v>(curr_state + head * S_v * S_v + col * S_v);
+            // a skipped state gather reads the sequence's row of the cache directly
+            const int64_t    state_in  = (s_ids ? s_ids[sequence] * s_row_stride : sequence * H * S_v * S_v) + h_idx * S_v * S_v;
+            simd<float, S_v> s         = block_load<float, S_v>(curr_state + state_in + col * S_v);
             float *          state_col = state + head * S_v * S_v + col * S_v;
             float *          attn      = dst + (sequence * n_tokens * H + h_idx) * S_v + col;
 
@@ -412,7 +416,8 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
     if (!kda && S_v == 128 && g_ggml_sycl_enable_esimd && state_slot_stride % 4 == 0 && (uintptr_t) state_d % 16 == 0) {
         launch_gated_delta_net_esimd(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3,
-                                     sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                                     sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride,
+                                     stream);
         return;
     }
 #endif
