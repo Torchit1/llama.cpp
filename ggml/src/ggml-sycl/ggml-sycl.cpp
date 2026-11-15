@@ -6780,6 +6780,41 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// Small host <-> device copies go through pinned host memory (GGML_SYCL_PIN_SMALL, live switch, default 1): with the V1
+// Level Zero adapter a copy from ordinary host memory costs several times the copy itself (measured between a B70 and
+// a B580: 60 KiB in 360 us from pageable memory, 48 us from pinned). One ring per device; a slot is reused only after
+// the queue has drained past it.
+struct ggml_sycl_pin_ring {
+    static constexpr size_t ring_size = 8u << 20;
+    static constexpr size_t max_copy  = 256u << 10;
+    uint8_t * base = nullptr;
+    size_t    used = 0;
+    bool      failed = false;
+
+    // pinned memory for a copy of size bytes on stream, nullptr if this copy should take the plain path
+    uint8_t * take(sycl::queue & stream, size_t size) {
+        if (size == 0 || size > max_copy || failed || ggml_live_switch("GGML_SYCL_PIN_SMALL", 1) == 0) {
+            return nullptr;
+        }
+        if (base == nullptr) {
+            base = (uint8_t *) sycl::malloc_host(ring_size, stream);
+            if (base == nullptr) {
+                failed = true;
+                return nullptr;
+            }
+        }
+        const size_t need = (size + 63) & ~(size_t) 63;
+        if (used + need > ring_size) {
+            stream.wait(); // queued copies may still read the start of the ring
+            used = 0;
+        }
+        uint8_t * res = base + used;
+        used += need;
+        return res;
+    }
+};
+static ggml_sycl_pin_ring g_ggml_sycl_pin_rings[GGML_SYCL_MAX_DEVICES];
+
 static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
                                                ggml_tensor *tensor,
                                                const void *data, size_t offset,
@@ -6792,6 +6827,10 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    if (uint8_t * pinned = g_ggml_sycl_pin_rings[sycl_ctx->device].take(*stream, size)) {
+        memcpy(pinned, data, size);
+        data = pinned;
+    }
     SYCL_CHECK(CHECK_TRY_ERROR(
         (stream)->memcpy((char *)tensor->data + offset, data, size)));
 }
@@ -6813,6 +6852,12 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    if (uint8_t * pinned = g_ggml_sycl_pin_rings[sycl_ctx->device].take(*stream, size)) {
+        // the caller's memory is filled before returning: every caller synchronizes right after a small read
+        SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(pinned, (const char *)tensor->data + offset, size).wait()));
+        memcpy(data, pinned, size);
+        return;
+    }
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
         data, (const char *)tensor->data + offset, size)));
 }
