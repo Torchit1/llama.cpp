@@ -71,6 +71,30 @@ static __dpct_inline__ int get_int_from_uint8(
   return x32;
 }
 
+// The same value read through aligned 32-bit words, shifted into place. For the layouts whose weights sit 2 bytes off
+// a 4-byte boundary in every other block (block_q4_0, block_q5_0, block_q2_0) this is about three times faster on
+// Intel GPUs than the 16-bit loads above; for weights that are already aligned (the K-quants) it is slower.
+static __dpct_inline__ int get_int_from_uint8_words(
+    const uint8_t* x8,
+    const int& i32) {
+  const uintptr_t  p  = (uintptr_t) (x8 + sizeof(int) * i32);
+  const uint32_t * a  = (const uint32_t *) (p & ~(uintptr_t) 3);
+  const uint32_t   sh = (uint32_t) (p & 3) * 8;
+  const uint32_t   lo = a[0];
+  if (sh == 0) {
+    return (int) lo; // already on a word: one load, and no read past it
+  }
+
+  return (int) ((lo >> sh) | (a[1] << (32 - sh)));
+}
+
+// A half at any 2-byte-aligned address, read through its aligned 32-bit word.
+static __dpct_inline__ float ggml_sycl_half_at(const void * ph) {
+  const uintptr_t  p = (uintptr_t) ph;
+  const uint32_t * a = (const uint32_t *) (p & ~(uintptr_t) 3);
+  return (float) sycl::bit_cast<sycl::half>((uint16_t) (a[0] >> ((uint32_t) (p & 3) * 8)));
+}
+
 static __dpct_inline__ int get_int_from_int8_aligned(
     const int8_t* x8,
     const int& i32) {
@@ -1114,12 +1138,12 @@ vec_dot_q4_0_q8_1(const void *__restrict__ vbq,
 
 #pragma unroll
     for (int i = 0; i < VDR_Q4_0_Q8_1_MMVQ; ++i) {
-        v[i]         = get_int_from_uint8(bq4_0->qs, iqs + i);
+        v[i]         = get_int_from_uint8_words(bq4_0->qs, iqs + i);
         u[2 * i + 0] = get_int_from_int8_aligned(bq8_1->qs, iqs + i);
         u[2 * i + 1] = get_int_from_int8_aligned(bq8_1->qs, iqs + i + QI4_0);
     }
 
-    return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, bq4_0->d, bq8_1->ds);
+    return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, ggml_sycl_half_at(&bq4_0->d), bq8_1->ds);
 }
 
 static __dpct_inline__ float
@@ -1136,8 +1160,8 @@ vec_dot_q2_0_q8_1(const void *__restrict__ vbq,
         const int base = 4 * (iqs + i);
 
         // Q2_0 has QK2_0 = 64 and uses 2 x QK8_1 blocks on the RHS.
-        v[2 * i + 0] = get_int_from_uint8(bq2_0->qs, iqs + i);
-        v[2 * i + 1] = get_int_from_uint8(bq2_0->qs, iqs + i + QI2_0);
+        v[2 * i + 0] = get_int_from_uint8_words(bq2_0->qs, iqs + i);
+        v[2 * i + 1] = get_int_from_uint8_words(bq2_0->qs, iqs + i + QI2_0);
 
         u[8 * i + 0] = get_int_from_int8_aligned(bq8_1[0].qs, base + 0);
         u[8 * i + 1] = get_int_from_int8_aligned(bq8_1[0].qs, base + 1);
@@ -1241,13 +1265,13 @@ vec_dot_q5_0_q8_1(const void *__restrict__ vbq,
 
 #pragma unroll
     for (int i = 0; i < VDR_Q5_0_Q8_1_MMVQ; ++i) {
-        vl[i]    = get_int_from_uint8(bq5_0->qs, iqs + i);
-        vh[i]    = get_int_from_uint8(bq5_0->qh, 0) >> (4 * (iqs + i));
+        vl[i]    = get_int_from_uint8_words(bq5_0->qs, iqs + i);
+        vh[i]    = get_int_from_uint8_words(bq5_0->qh, 0) >> (4 * (iqs + i));
         u[2*i+0] = get_int_from_int8_aligned(bq8_1->qs, iqs + i);
         u[2*i+1] = get_int_from_int8_aligned(bq8_1->qs, iqs + i + QI5_0);
     }
 
-    return vec_dot_q5_0_q8_1_impl<VDR_Q5_0_Q8_1_MMVQ>(vl, vh, u, bq5_0->d, bq8_1->ds);
+    return vec_dot_q5_0_q8_1_impl<VDR_Q5_0_Q8_1_MMVQ>(vl, vh, u, ggml_sycl_half_at(&bq5_0->d), bq8_1->ds);
 }
 
 static __dpct_inline__ float
