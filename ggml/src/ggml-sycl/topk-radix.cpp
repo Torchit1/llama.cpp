@@ -133,17 +133,24 @@ static void top_k_radix_select_f32(
     // columns fill the tail. Both counters live in SLM since the whole row is this group.
     const uint32_t base_eq = (uint32_t) k - need;
 
-    for (int col = tid; col < ncols; col += block_size) {
-        const uint32_t kp = top_k_radix_key(src[col]) & mask;
-        if (kp > prefix) {
-            const uint32_t pos = local_atomic(*s_cnt_gt).fetch_add(1u);
-            dst_idx[pos] = col;
-        } else if (kp == prefix) {
-            const uint32_t pos = local_atomic(*s_cnt_eq).fetch_add(1u);
-            if (pos < need) {
-                dst_idx[base_eq + pos] = col;
-            }
+    // Positions come from scans in column order, not from the order the lanes arrive in: which of several
+    // pivot-equal columns fill the tail must not depend on timing (the lowest columns win, as on the other backends),
+    // and the output order is then the same every run as well.
+    uint32_t done_gt = 0, done_eq = 0;
+    for (int c0 = 0; c0 < ncols; c0 += block_size) {
+        const int      col = c0 + tid;
+        const uint32_t kp  = col < ncols ? top_k_radix_key(src[col]) & mask : 0u;
+        const uint32_t gt  = col < ncols && kp > prefix ? 1u : 0u;
+        const uint32_t eq  = col < ncols && kp == prefix ? 1u : 0u;
+        const uint32_t before_gt = sycl::exclusive_scan_over_group(item_ct1.get_group(), gt, sycl::plus<uint32_t>());
+        const uint32_t before_eq = sycl::exclusive_scan_over_group(item_ct1.get_group(), eq, sycl::plus<uint32_t>());
+        if (gt) {
+            dst_idx[done_gt + before_gt] = col;
+        } else if (eq && done_eq + before_eq < need) {
+            dst_idx[base_eq + done_eq + before_eq] = col;
         }
+        done_gt += sycl::reduce_over_group(item_ct1.get_group(), gt, sycl::plus<uint32_t>());
+        done_eq += sycl::reduce_over_group(item_ct1.get_group(), eq, sycl::plus<uint32_t>());
     }
 }
 
@@ -360,6 +367,8 @@ static void top_k_radix_split_emit_f32(
     const float *   src,
     int32_t *       dst_idx,
     uint32_t *      state,
+    uint32_t *      part_cnt,   // [nparts][2]: columns of each part that beat / equal the pivot
+    const bool      count_only, // first launch: fill part_cnt; second: emit
     const int       ncols,
     const int       k,
     const int       part,
@@ -401,42 +410,53 @@ static void top_k_radix_split_emit_f32(
     const int col0  = part * chunk;
     const int col1  = std::min(ncols, col0 + chunk);
 
-    // Counting first and reserving one range per group keeps the row's two counters out of
-    // the inner loop: a per-element global atomic on a single address serialises the whole
-    // emit, and at k in the thousands that alone outweighs every read the kernel does.
-    for (int col = col0 + tid; col < col1; col += block_size) {
-        const uint32_t kp = top_k_radix_key(src[col]) & mask;
-        if (kp > prefix) {
-            local_atomic(*s_gt).fetch_add(1u);
-        } else if (kp == prefix) {
-            local_atomic(*s_eq).fetch_add(1u);
-        }
-    }
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-
-    if (tid == 0) {
-        const uint32_t n_gt = *s_gt;
-        const uint32_t n_eq = *s_eq;
-        *s_base_gt = n_gt ? top_k_radix_gatomic(state[SYCL_TOP_K_RADIX_ROW_CNT_GT]).fetch_add(n_gt) : 0u;
-        *s_base_eq = n_eq ? top_k_radix_gatomic(state[SYCL_TOP_K_RADIX_ROW_CNT_EQ]).fetch_add(n_eq) : 0u;
-        *s_gt = 0;
-        *s_eq = 0;
-    }
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-
-    const uint32_t base_gt_g = *s_base_gt;
-    const uint32_t base_eq_g = *s_base_eq;
-
-    for (int col = col0 + tid; col < col1; col += block_size) {
-        const uint32_t kp = top_k_radix_key(src[col]) & mask;
-        if (kp > prefix) {
-            dst_idx[base_gt_g + local_atomic(*s_gt).fetch_add(1u)] = col;
-        } else if (kp == prefix) {
-            const uint32_t pos = base_eq_g + local_atomic(*s_eq).fetch_add(1u);
-            if (pos < need) {
-                dst_idx[base_eq + pos] = col;
+    // Two launches. The first counts each part's columns above and equal to the pivot. The second places them: a
+    // part starts after the columns of the parts before it, and inside a part positions come from scans in column
+    // order. Nothing depends on the order groups or lanes arrive in, so pivot-equal columns are taken lowest first
+    // (as on the other backends) and the output order is the same every run.
+    if (count_only) {
+        for (int col = col0 + tid; col < col1; col += block_size) {
+            const uint32_t kp = top_k_radix_key(src[col]) & mask;
+            if (kp > prefix) {
+                local_atomic(*s_gt).fetch_add(1u);
+            } else if (kp == prefix) {
+                local_atomic(*s_eq).fetch_add(1u);
             }
         }
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+        if (tid == 0) {
+            part_cnt[2 * part + 0] = *s_gt;
+            part_cnt[2 * part + 1] = *s_eq;
+        }
+        return;
+    }
+
+    if (tid == 0) {
+        uint32_t b_gt = 0, b_eq = 0;
+        for (int p = 0; p < part; p++) {
+            b_gt += part_cnt[2 * p + 0];
+            b_eq += part_cnt[2 * p + 1];
+        }
+        *s_base_gt = b_gt;
+        *s_base_eq = b_eq;
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+
+    uint32_t done_gt = *s_base_gt, done_eq = *s_base_eq;
+    for (int c0 = col0; c0 < col1; c0 += block_size) {
+        const int      col = c0 + tid;
+        const uint32_t kp  = col < col1 ? top_k_radix_key(src[col]) & mask : 0u;
+        const uint32_t gt  = col < col1 && kp > prefix ? 1u : 0u;
+        const uint32_t eq  = col < col1 && kp == prefix ? 1u : 0u;
+        const uint32_t before_gt = sycl::exclusive_scan_over_group(item_ct1.get_group(), gt, sycl::plus<uint32_t>());
+        const uint32_t before_eq = sycl::exclusive_scan_over_group(item_ct1.get_group(), eq, sycl::plus<uint32_t>());
+        if (gt) {
+            dst_idx[done_gt + before_gt] = col;
+        } else if (eq && done_eq + before_eq < need) {
+            dst_idx[base_eq + done_eq + before_eq] = col;
+        }
+        done_gt += sycl::reduce_over_group(item_ct1.get_group(), gt, sycl::plus<uint32_t>());
+        done_eq += sycl::reduce_over_group(item_ct1.get_group(), eq, sycl::plus<uint32_t>());
     }
 }
 
@@ -492,25 +512,30 @@ static void top_k_radix_split_f32_sycl(
         });
     }
 
-    main_stream->submit([&](sycl::handler &cgh) {
-        sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(8), cgh);
+    ggml_sycl_pool_alloc<uint32_t> cnt_alloc(ctx.pool(), (size_t) nrows * nparts * 2);
+    uint32_t * part_cnt = cnt_alloc.get();
+    for (const bool count_only : { true, false }) {
+        main_stream->submit([&](sycl::handler &cgh) {
+            sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(8), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<1>(grid_dims * block_dims, block_dims),
-            [=](sycl::nd_item<1> item_ct1) {
-                const int g    = item_ct1.get_group(0);
-                const int row  = g / nparts;
-                const int part = g % nparts;
+            cgh.parallel_for(
+                sycl::nd_range<1>(grid_dims * block_dims, block_dims),
+                [=](sycl::nd_item<1> item_ct1) {
+                    const int g    = item_ct1.get_group(0);
+                    const int row  = g / nparts;
+                    const int part = g % nparts;
 
-                top_k_radix_split_emit_f32(
-                    src + (int64_t) row * ncols,
-                    dst_indices + (int64_t) row * k,
-                    state + (int64_t) row * SYCL_TOP_K_RADIX_ROW_WORDS,
-                    (int) ncols, k, part, nparts,
-                    slm.get_multi_ptr<sycl::access::decorated::no>().get(),
-                    item_ct1);
-            });
-    });
+                    top_k_radix_split_emit_f32(
+                        src + (int64_t) row * ncols,
+                        dst_indices + (int64_t) row * k,
+                        state + (int64_t) row * SYCL_TOP_K_RADIX_ROW_WORDS,
+                        part_cnt + (int64_t) row * nparts * 2, count_only,
+                        (int) ncols, k, part, nparts,
+                        slm.get_multi_ptr<sycl::access::decorated::no>().get(),
+                        item_ct1);
+                });
+        });
+    }
 }
 
 void ggml_sycl_top_k_radix(
