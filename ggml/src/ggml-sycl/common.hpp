@@ -82,6 +82,17 @@ inline bool ggml_sycl_dnn_deterministic() {
     static const bool v = ggml_sycl_get_env("GGML_SYCL_DNN_DETERMINISTIC", 1) != 0;
     return v;
 }
+
+// GGML_SYCL_DETERMINISTIC=1: output identical whatever the batch / ubatch size, on the same device and build.
+// = batch-invariant mul_mats (GGML_SYCL_BATCH_INVARIANT) + no fused kernels. Diagnostic mode: prompts are much slower.
+inline bool ggml_sycl_deterministic() {
+    static const bool v = ggml_sycl_get_env("GGML_SYCL_DETERMINISTIC", 0) != 0;
+    return v;
+}
+inline bool ggml_sycl_batch_invariant() {
+    static const bool v = ggml_sycl_deterministic() || ggml_sycl_get_env("GGML_SYCL_BATCH_INVARIANT", 0) != 0;
+    return v;
+}
 extern int g_ggml_sycl_enable_xmx_esimd;
 extern int g_ggml_sycl_xmx_max_cols;
 extern int g_ggml_sycl_xmx_glu_max_cols;

@@ -446,6 +446,9 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
         g_ggml_sycl_enable_fusion = ggml_sycl_get_env("GGML_SYCL_ENABLE_FUSION", 1);
+        if (ggml_sycl_deterministic()) {
+            g_ggml_sycl_enable_fusion = 0;  // fused kernels are not checked for batch invariance
+        }
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
         g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
         g_ggml_sycl_enable_xmx_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_XMX_ESIMD", 1);
@@ -555,6 +558,8 @@ static void ggml_check_sycl() try {
 #if defined(GGML_SYCL_DNNL)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: %d\n", g_ggml_sycl_enable_dnn);
         GGML_LOG_INFO("  GGML_SYCL_DNN_DETERMINISTIC: %d\n", (int) ggml_sycl_dnn_deterministic());
+        GGML_LOG_INFO("  GGML_SYCL_DETERMINISTIC: %d (batch-invariant mul_mats: %d)\n", (int) ggml_sycl_deterministic(),
+                      (int) ggml_sycl_batch_invariant());
         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN: %d\n", g_ggml_sycl_fa_onednn);
 #else
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: DNN disabled by compile flag\n");
@@ -5153,6 +5158,25 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // asserts GGML_OP_MUL_MAT for the same reason.
     if (dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
         ggml_sycl_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+
+    // Batch-invariant mode: a multi-token mul_mat on weights runs one token at a time through this same function's
+    // single-token (decode) path, so each token's result does not depend on how many tokens share the batch.
+    // Also covers MUL_MAT_ID, whose per-expert calls arrive here with a varying token count.
+    if (ggml_sycl_batch_invariant() && (dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_MUL_MAT_ID) &&
+        src0->type != GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src1->ne[1] > 1 && src1->ne[2] == 1 &&
+        src1->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 && src1->nb[0] == sizeof(float) &&
+        dst->nb[0] == sizeof(float) &&
+        !(dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD)) {
+        for (int64_t j = 0; j < src1->ne[1]; ++j) {
+            ggml_tensor x1 = *src1;
+            ggml_tensor d1 = *dst;
+            x1.ne[1] = 1; x1.nb[2] = x1.nb[3] = x1.nb[1]; x1.data = (char *) src1->data + j * src1->nb[1];
+            d1.ne[1] = 1; d1.nb[2] = d1.nb[3] = d1.nb[1]; d1.data = (char *) dst->data + j * dst->nb[1];
+            d1.src[1] = &x1;
+            ggml_sycl_mul_mat(ctx, src0, &x1, &d1);
+        }
         return;
     }
 
