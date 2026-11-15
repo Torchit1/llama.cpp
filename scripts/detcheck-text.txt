@@ -1,0 +1,2043 @@
+# Build llama.cpp locally
+
+The main product of this project is the `llama` library. Its C-style interface can be found in [include/llama.h](../include/llama.h).
+
+The project also includes many example programs and tools using the `llama` library. The examples range from simple, minimal code snippets to sophisticated sub-projects such as an OpenAI-compatible HTTP server.
+
+**To get the Code:**
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+```
+
+The following sections describe how to build with different backends and options.
+
+* [CPU Build](#cpu-build)
+* [BLAS Build](#blas-build)
+* [Metal Build](#metal-build)
+* [SYCL](#sycl)
+* [CUDA](#cuda)
+* [MUSA](#musa)
+* [HIP](#hip)
+* [Vulkan](#vulkan)
+* [CANN](#cann)
+* [ZenDNN](#zendnn)
+* [Arm® KleidiAI™](#arm-kleidiai)
+* [OpenCL](#opencl)
+* [Android](#android-1)
+* [OpenVINO](#openvino)
+* [Hexagon](#hexagon)
+* [Notes about GPU-accelerated backends](#notes-about-gpu-accelerated-backends)
+
+## CPU Build
+
+Build llama.cpp using `CMake`:
+
+```bash
+cmake -B build
+cmake --build build --config Release
+```
+
+**Notes**:
+
+- For faster compilation, add the `-j` argument to run multiple jobs in parallel, or use a generator that does this automatically such as Ninja. For example, `cmake --build build --config Release -j 8` will run 8 jobs in parallel.
+- For faster repeated compilation, install [ccache](https://ccache.dev/)
+- For debug builds, there are two cases:
+
+    1. Single-config generators (e.g. default = `Unix Makefiles`; note that they just ignore the `--config` flag):
+
+       ```bash
+       cmake -B build -DCMAKE_BUILD_TYPE=Debug
+       cmake --build build
+       ```
+
+    2. Multi-config generators (`-G` param set to Visual Studio, XCode...):
+
+       ```bash
+       cmake -B build -G "Xcode"
+       cmake --build build --config Debug
+       ```
+
+    For more details and a list of supported generators, see the [CMake documentation](https://cmake.org/cmake/help/latest/manual/cmake-generators.7.html).
+- For static builds, add `-DBUILD_SHARED_LIBS=OFF`:
+  ```
+  cmake -B build -DBUILD_SHARED_LIBS=OFF
+  cmake --build build --config Release
+  ```
+
+- Building for Windows (x86, x64 and arm64) with MSVC or clang as compilers:
+    - Install Visual Studio 2022, e.g. via the [Community Edition](https://visualstudio.microsoft.com/vs/community/). In the installer, select at least the following options (this also automatically installs the required additional tools like CMake,...):
+    - Tab Workload: Desktop-development with C++
+    - Tab Components (select quickly via search): C++-_CMake_ Tools for Windows, _Git_ for Windows, C++-_Clang_ Compiler for Windows, MS-Build Support for LLVM-Toolset (clang)
+    - Please remember to always use a Developer Command Prompt / PowerShell for VS2022 for git, build, test
+    - For Windows on ARM (arm64, WoA), build with:
+      ```bash
+      cmake --preset arm64-windows-llvm-release -D GGML_OPENMP_FETCH=ON
+      cmake --build build-arm64-windows-llvm-release
+      ```
+      - Use `ARM64 Native Tools Command Prompt for VS 2022` if you are building on an ARM64 machine.
+      - `GGML_OPENMP_FETCH` downloads the official LLVM OpenMP runtime and requires Clang, 7-Zip and network access during configuration. CMake selects the runtime from the target architecture, so this also works when cross-compiling for WoA from x64. The extracted header, import library, DLL and OpenMP license are placed under `build/_deps`. The build copies `libomp.dll` and `LICENSE-LLVM-OpenMP` to the runtime output directory and installs them together. Omit the option to use CMake's normal OpenMP detection, or pass `-D GGML_OPENMP=OFF` to disable OpenMP.
+    - For building with ninja generator and clang compiler as default:
+      - Set path:
+        ```
+        set LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0\um\x64;C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.41.34120\lib\x64\uwp;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0\ucrt\x64
+        ```
+      - Run:
+        ```bash
+        cmake --preset x64-windows-llvm-release
+        cmake --build build-x64-windows-llvm-release
+        ```
+- If you want HTTPS/TLS features, you may install OpenSSL development libraries. If not installed, the project will build and run without SSL support.
+  - **Debian / Ubuntu:** `sudo apt-get install libssl-dev`
+  - **Fedora / RHEL / Rocky / Alma:** `sudo dnf install openssl-devel`
+  - **Arch / Manjaro:** `sudo pacman -S openssl`
+
+## BLAS Build
+
+Building the program with BLAS support may lead to some performance improvements in prompt processing using batch sizes higher than 32 (the default is 512). Using BLAS doesn't affect the generation performance. There are currently several different BLAS implementations available for build and use:
+
+### Accelerate Framework
+
+This is only available on Mac PCs and it's enabled by default. You can just build using the normal instructions.
+
+### OpenBLAS
+
+This provides BLAS acceleration using only the CPU. Make sure to have OpenBLAS installed on your machine.
+
+- Using `CMake` on Linux:
+
+    ```bash
+    cmake -B build -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS
+    cmake --build build --config Release
+    ```
+
+### BLIS
+
+Check [BLIS.md](./backend/BLIS.md) for more information.
+
+### AMD AOCL-BLAS
+
+For AMD CPU inference, the [ZenDNN backend](#zendnn) is recommended. AOCL-BLAS is also available as a vendor option for the generic `GGML_BLAS` backend.
+
+Source `amd-libs.cfg` from your AOCL install (MT tree by default), then build (CMake 3.27+ recommended for the `AOCL` / `AOCL_mt` vendors):
+
+```bash
+source /opt/aocl/<version>/aocc/MT/amd-libs.cfg   # adjust path; ST tree uses .../ST/amd-libs.cfg
+cmake -B build -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=AOCL_mt -DBLAS_INCLUDE_DIRS="${AOCL_ROOT}/include" -DGGML_NATIVE=ON
+cmake --build build --config Release
+```
+
+Full steps, threading notes, and a fallback for older CMake: [AOCL.md](./backend/AOCL.md).
+
+### Intel oneMKL
+
+Building through oneAPI compilers will make avx_vnni instruction set available for intel processors that do not support avx512 and avx512_vnni. Please note that this build config **does not support Intel GPU**. For Intel GPU support, please refer to [llama.cpp for SYCL](./backend/SYCL.md).
+
+- Using manual oneAPI installation:
+  By default, `GGML_BLAS_VENDOR` is set to `Generic`, so if you already sourced intel environment script and assign `-DGGML_BLAS=ON` in cmake, the mkl version of Blas will automatically been selected. Otherwise please install oneAPI and follow the below steps:
+    ```bash
+    source /opt/intel/oneapi/setvars.sh # You can skip this step if  in oneapi-basekit docker image, only required for manual installation
+    cmake -B build -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Intel10_64lp -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_NATIVE=ON
+    cmake --build build --config Release
+    ```
+
+- Using oneAPI docker image:
+  If you do not want to source the environment vars and install oneAPI manually, you can also build the code using intel docker container: [oneAPI-basekit](https://hub.docker.com/r/intel/oneapi-basekit). Then, you can use the commands given above.
+
+Check [Optimizing and Running LLaMA2 on Intel® CPU](https://builders.intel.com/solutionslibrary/optimizing-and-running-llama2-on-intel-cpu) for more information.
+
+### Other BLAS libraries
+
+Any other BLAS library can be used by setting the `GGML_BLAS_VENDOR` option. See the [CMake documentation](https://cmake.org/cmake/help/latest/module/FindBLAS.html#blas-lapack-vendors) for a list of supported vendors.
+
+## Metal Build
+
+On MacOS, Metal is enabled by default. Using Metal makes the computation run on the GPU.
+To disable the Metal build at compile time use the `-DGGML_METAL=OFF` cmake option.
+
+When built with Metal support, you can explicitly disable GPU inference with the `--n-gpu-layers 0` command-line argument.
+
+## SYCL
+
+SYCL is a higher-level programming model to improve programming productivity on various hardware accelerators.
+
+llama.cpp based on SYCL is used to **support Intel GPU** (Data Center Max series, Flex series, Arc series, Built-in GPU and iGPU).
+
+For detailed info, please refer to [llama.cpp for SYCL](./backend/SYCL.md).
+
+## CUDA
+
+This provides GPU acceleration using an NVIDIA GPU. Make sure to have the [CUDA toolkit](https://developer.nvidia.com/cuda-toolkit) installed.
+
+#### Download directly from NVIDIA
+You may find the official downloads here: [NVIDIA developer site](https://developer.nvidia.com/cuda-downloads).
+
+
+#### Compile and run inside a Fedora Toolbox Container
+We also have a [guide](./backend/CUDA-FEDORA.md) for setting up CUDA toolkit in a Fedora [toolbox container](https://containertoolbx.org/).
+
+**Recommended for:**
+- ***Necessary*** for users of [Atomic Desktops for Fedora](https://fedoraproject.org/atomic-desktops/); such as: [Silverblue](https://fedoraproject.org/atomic-desktops/silverblue/) and [Kinoite](https://fedoraproject.org/atomic-desktops/kinoite/).
+  - (there are no supported CUDA packages for these systems)
+- ***Necessary*** for users that have a host that is not a: [Supported Nvidia CUDA Release Platform](https://developer.nvidia.com/cuda-downloads).
+  - (for example, you may have [Fedora 42 Beta](https://fedoramagazine.org/announcing-fedora-linux-42-beta/) as your host operating system)
+- ***Convenient*** For those running [Fedora Workstation](https://fedoraproject.org/workstation/) or [Fedora KDE Plasma Desktop](https://fedoraproject.org/spins/kde), and want to keep their host system clean.
+- *Optionally* toolbox packages are available: [Arch Linux](https://archlinux.org/), [Red Hat Enterprise Linux >= 8.5](https://www.redhat.com/en/technologies/linux-platforms/enterprise-linux), or [Ubuntu](https://ubuntu.com/download)
+
+
+### Compilation
+
+Make sure to read the notes about the CPU build for general instructions for e.g. speeding up the compilation.
+
+```bash
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --config Release
+```
+
+To use a specific CCCL version instead of the one bundled with the installed CUDA Toolkit, add `-DGGML_CUDA_CCCL_VERSION=vMAJOR.MINOR.PATCH`. CUB DeviceTopK requires CCCL 3.4.3 or newer; older versions use the sort fallback.
+
+Note that this also builds the CPU backend by default. On Windows on ARM, MSVC's
+support for the ARM NEON intrinsics used by the CPU backend may be incomplete, so
+a CUDA build produced entirely with MSVC might have a slower CPU backend. If CPU
+performance matters, try following the split build used in our release workflow
+([.github/workflows/release.yml](../.github/workflows/release.yml)): the CPU backend
+is built with clang (`cmake/arm64-windows-llvm.cmake`) and the CUDA backend with MSVC
+(`cmake/arm64-windows-msvc-cuda.cmake`), and the artifacts are merged afterwards.
+
+### Non-Native Builds
+
+By default llama.cpp will be built for the hardware that is connected to the system at that time.
+For a build covering all CUDA GPUs, disable `GGML_NATIVE`:
+
+```bash
+cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=OFF
+```
+
+The resulting binary should run on all CUDA GPUs with optimal performance, though some just-in-time compilation may be required.
+
+### Override Compute Capability Specifications
+
+If `nvcc` cannot detect your gpu, you may get compile warnings such as:
+ ```text
+nvcc warning : Cannot find valid GPU for '-arch=native', default arch is used
+```
+
+One option is to do a non-native build as described above.
+However, this will result in a large binary that takes a long time to compile.
+Alternatively it is also possible to explicitly specify CUDA architectures.
+This may also make sense for a non-native build, for that one should look at the logic in `ggml/src/ggml-cuda/CMakeLists.txt` as a starting point.
+
+To override the default CUDA architectures:
+
+#### 1. Take note of the `Compute Capability` of your NVIDIA devices: ["CUDA: Your GPU Compute > Capability"](https://developer.nvidia.com/cuda-gpus).
+
+```text
+GeForce RTX 4090      8.9
+GeForce RTX 3080 Ti   8.6
+GeForce RTX 3070      8.6
+```
+
+#### 2. Manually list each varying `Compute Capability` in the `CMAKE_CUDA_ARCHITECTURES` list.
+
+```bash
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="86;89"
+```
+
+### Overriding the CUDA Version
+
+If you have multiple CUDA installations on your system and want to compile llama.cpp for a specific one, e.g. for CUDA 11.7 installed under `/opt/cuda-11.7`:
+
+```bash
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/opt/cuda-11.7/bin/nvcc -DCMAKE_INSTALL_RPATH="/opt/cuda-11.7/lib64;\$ORIGIN" -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+```
+
+#### Fixing Compatibility Issues with Old CUDA and New glibc
+
+If you try to use an old CUDA version (e.g. v11.7) with a new glibc version you can get errors like this:
+
+```
+/usr/include/bits/mathcalls.h(83): error: exception specification is
+  incompatible with that of previous function "cospi"
+
+
+  /opt/cuda-11.7/bin/../targets/x86_64-linux/include/crt/math_functions.h(5545):
+  here
+```
+
+It seems the least bad solution is to patch the CUDA installation to declare the correct signatures.
+Replace the following lines in `/path/to/your/cuda/installation/targets/x86_64-linux/include/crt/math_functions.h`:
+
+```C++
+// original lines
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ double                 cospi(double x);
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ float                  cospif(float x);
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ double                 sinpi(double x);
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ float                  sinpif(float x);
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ double                 rsqrt(double x);
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ float                  rsqrtf(float x);
+
+// edited lines
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ double                 cospi(double x) noexcept (true);
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ float                  cospif(float x) noexcept (true);
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ double                 sinpi(double x) noexcept (true);
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ float                  sinpif(float x) noexcept (true);
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ double                 rsqrt(double x) noexcept (true);
+extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ float                  rsqrtf(float x) noexcept (true);
+```
+
+### Runtime CUDA environmental variables
+
+You may set the [cuda environmental variables](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#env-vars) at runtime.
+
+```bash
+# Use `CUDA_VISIBLE_DEVICES` to hide the first compute device.
+CUDA_VISIBLE_DEVICES="-0" ./build/bin/llama-server --model /srv/models/llama.gguf
+```
+
+#### CUDA_SCALE_LAUNCH_QUEUES
+
+The environment variable [`CUDA_SCALE_LAUNCH_QUEUES`](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html#cuda-scale-launch-queues) controls the size of CUDA's command buffer, which determines how many GPU operations can be queued before the CPU must wait for the GPU to catch up. A larger buffer reduces CPU-side stalls and allows more work to be queued on a GPU.
+
+Consider setting `CUDA_SCALE_LAUNCH_QUEUES=4x`, which increases the CUDA command buffer to 4 times its default size. This optimization is particularly beneficial for **Multi-GPU setups with pipeline parallelism**, where it significantly improves prompt processing throughput by allowing more operations to be enqueued across GPUs.
+
+#### GGML_CUDA_CUBLAS_COMPUTE_TYPE
+
+Override default, speed-optimized compute types for cuBLAS matrix multiplications.
+Legal values: `auto`, `f16`, `fp16`, `bf16`, `f32`, `fp32`.
+
+#### GGML_CUDA_MMQ_PREC
+
+Override the activation precision that the model requests for NVFP4 and MXFP4 matrix multiplications.
+Currently supported values: `auto`, `q8`, `q4`.
+
+NVFP4 and MXFP4 layers marked as W4A16 request 8-bit activations, so on Blackwell those layers run through the W4A8 path instead of the native W4A4 path. Set `q4` to keep the native W4A4 path for faster prompt processing at the cost of accuracy, or `q8` to use the W4A8 path for every layer, `auto` uses per-tensor prec metadata (this is the same behavior as when the environment variable is not set).
+
+### Unified Memory
+
+The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted. In Windows this setting is available in the NVIDIA control panel as `System Memory Fallback`.
+
+### Peer Access
+
+The environment variable `GGML_CUDA_P2P` can be set to enable peer-to-peer access between multiple GPUs, allowing them to transfer data directly rather than to go through system memory.
+Requires driver support (usually restricted to workstation/datacenter GPUs).
+May cause crashes or corrupted outputs for some motherboards and BIOS settings (e.g. IOMMU).
+
+### Performance Tuning
+
+The following compilation options are also available to tweak performance:
+
+| Option                        | Legal values           | Default | Description                                                                                                                                                                                                                                                                                                                                                                      |
+|-------------------------------|------------------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| GGML_CUDA_FORCE_MMQ           | Boolean                | false   | Force the use of custom matrix multiplication kernels for quantized models instead of FP16 cuBLAS even if there is no int8 tensor core implementation available (affects V100, CDNA and RDNA3+). MMQ kernels are enabled by default on GPUs with int8 tensor core support. With MMQ force enabled, speed for large batch sizes will be worse but VRAM consumption will be lower. |
+| GGML_CUDA_FORCE_CUBLAS        | Boolean                | false   | Force the use of FP16 cuBLAS instead of custom matrix multiplication kernels for quantized models. There may be issues with numerical overflows (except for V100, CDNA and RDNA4 which use FP32 compute type by default) and memory use will be higher. Prompt processing may become faster on recent datacenter GPUs (the custom kernels were tuned primarily for RTX 3000/4000).   |
+| GGML_CUDA_FA_QUANTS           | `all` or `type_K-type_V` list | q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16 | Select which K/V type combinations to compile the FlashAttention CUDA kernels for. `all` compiles every combination, but compilation takes much longer. Otherwise a `;`-separated list of `type_K-type_V` pairs; f16-f16 is always compiled. Combinations that were not compiled fall back to f16-f16 kernel with a warning. Legal types: f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0. |
+| GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Deprecated alias for `GGML_CUDA_FA_QUANTS=all`.                                                                                                                                                                                                                                                                                                                               |
+
+## MUSA
+
+This provides GPU acceleration using a Moore Threads GPU. Make sure to have the [MUSA SDK](https://developer.mthreads.com/musa/musa-sdk) installed.
+
+#### Download directly from Moore Threads
+
+You may find the official downloads here: [Moore Threads developer site](https://developer.mthreads.com/sdk/download/musa).
+
+### Compilation
+
+```bash
+cmake -B build -DGGML_MUSA=ON
+cmake --build build --config Release
+```
+
+#### Override Compute Capability Specifications
+
+By default, compute capabilities `2.2` (MTT S4000) and `3.1` (MTT S5000) are enabled, compute capability `2.1` (MTT S70, MTT S80, MTT S3000) is deprecated and has to be enabled explicitly. To customize this behavior, you can specify the `MUSA_ARCHITECTURES` option in the CMake command:
+
+```bash
+cmake -B build -DGGML_MUSA=ON -DMUSA_ARCHITECTURES="31"
+cmake --build build --config Release
+```
+
+This configuration enables only compute capability `3.1` (MTT S5000) during compilation, which can help reduce compilation time.
+
+#### Compilation options
+
+Most of the compilation options available for CUDA should also be available for MUSA, though they haven't been thoroughly tested yet.
+
+- For static builds, add `-DBUILD_SHARED_LIBS=OFF` and `-DCMAKE_POSITION_INDEPENDENT_CODE=ON`:
+  ```
+  cmake -B build -DGGML_MUSA=ON \
+    -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+  cmake --build build --config Release
+  ```
+
+### Runtime MUSA environmental variables
+
+You may set the [musa environmental variables](https://docs.mthreads.com/musa-sdk/musa-sdk-doc-online/programming_guide/Z%E9%99%84%E5%BD%95/) at runtime.
+
+```bash
+# Use `MUSA_VISIBLE_DEVICES` to hide the first compute device.
+MUSA_VISIBLE_DEVICES="-0" ./build/bin/llama-server --model /srv/models/llama.gguf
+```
+
+### Unified Memory
+
+The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted.
+
+## HIP
+
+This provides GPU acceleration on HIP-supported AMD GPUs.
+Make sure to have ROCm installed.
+You can download it from your Linux distro's package manager or from here: [ROCm Quick Start (Linux)](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/tutorial/quick-start.html#rocm-install-quick).
+
+- Using `CMake` for Linux (assuming a gfx1030-compatible AMD GPU):
+  ```bash
+  HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+      cmake -S . -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1030 -DCMAKE_BUILD_TYPE=Release \
+      && cmake --build build --config Release -- -j 16
+  ```
+
+  Note: `GPU_TARGETS` is optional, omitting it will build the code for all GPUs in the current system.
+
+  Note that if you get the following error:
+  ```
+  clang: error: cannot find ROCm device library; provide its path via '--rocm-path' or '--rocm-device-lib-path', or pass '-nogpulib' to build without ROCm device library
+  ```
+  Try searching for a directory under `HIP_PATH` that contains the file
+  `oclc_abi_version_400.bc`. Then, add the following to the start of the
+  command: `HIP_DEVICE_LIB_PATH=<directory-you-just-found>`, so something
+  like:
+  ```bash
+  HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -p)" \
+  HIP_DEVICE_LIB_PATH=<directory-you-just-found> \
+      cmake -S . -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1030 -DCMAKE_BUILD_TYPE=Release \
+      && cmake --build build -- -j 16
+  ```
+
+- Using `CMake` for Windows (using x64 Native Tools Command Prompt for VS, and assuming a gfx1100-compatible AMD GPU):
+  ```bash
+  set PATH=%HIP_PATH%\bin;%PATH%
+  cmake -S . -B build -G Ninja -DGPU_TARGETS=gfx1100 -DGGML_HIP=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+  cmake --build build
+  ```
+  If necessary, adapt `GPU_TARGETS` to the GPU arch you want to compile for. The above example uses `gfx1100` that corresponds to Radeon RX 7900XTX/XT/GRE. You can find a list of targets [here](https://llvm.org/docs/AMDGPUUsage.html#processors)
+  Find your gpu version string by matching the most significant version information from `rocminfo | grep gfx | head -1 | awk '{print $2}'` with the list of processors, e.g. `gfx1035` maps to `gfx1030`.
+
+
+The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/latest/understand/gpu_isolation.html#hip-visible-devices) can be used to specify which GPU(s) will be used.
+If your GPU is not officially supported you can use the environment variable [`HSA_OVERRIDE_GFX_VERSION`] set to a similar GPU, for example 10.3.0 on RDNA2 (e.g. gfx1030, gfx1031, or gfx1035) or 11.0.0 on RDNA3. Note that [`HSA_OVERRIDE_GFX_VERSION`] is [not supported on Windows](https://github.com/ROCm/ROCm/issues/2654)
+
+### Unified Memory
+
+On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).
+
+## Vulkan
+
+### For Windows Users:
+**w64devkit**
+
+Download and extract [`w64devkit`](https://github.com/skeeto/w64devkit/releases).
+
+Download and install the [`Vulkan SDK`](https://vulkan.lunarg.com/sdk/home#windows) with the default settings.
+
+Launch `w64devkit.exe` and run the following commands to copy Vulkan dependencies:
+```sh
+SDK_VERSION=1.3.283.0
+cp /VulkanSDK/$SDK_VERSION/Bin/glslc.exe $W64DEVKIT_HOME/bin/
+cp /VulkanSDK/$SDK_VERSION/Lib/vulkan-1.lib $W64DEVKIT_HOME/x86_64-w64-mingw32/lib/
+cp -r /VulkanSDK/$SDK_VERSION/Include/* $W64DEVKIT_HOME/x86_64-w64-mingw32/include/
+cat > $W64DEVKIT_HOME/x86_64-w64-mingw32/lib/pkgconfig/vulkan.pc <<EOF
+Name: Vulkan-Loader
+Description: Vulkan Loader
+Version: $SDK_VERSION
+Libs: -lvulkan-1
+EOF
+
+```
+
+Switch into the `llama.cpp` directory and build using CMake.
+```sh
+cmake -B build -DGGML_VULKAN=ON
+cmake --build build --config Release
+```
+
+**Git Bash MINGW64**
+
+Download and install [`Git-SCM`](https://git-scm.com/downloads/win) with the default settings
+
+Download and install [`Visual Studio Community Edition`](https://visualstudio.microsoft.com/) and make sure you select `C++`
+
+Download and install [`CMake`](https://cmake.org/download/) with the default settings
+
+Download and install the [`Vulkan SDK`](https://vulkan.lunarg.com/sdk/home#windows) with the default settings.
+
+Go into your `llama.cpp` directory and right click, select `Open Git Bash Here` and then run the following commands
+
+```
+cmake -B build -DGGML_VULKAN=ON
+cmake --build build --config Release
+```
+
+Now you can load the model in conversation mode using `Vulkan`
+
+```sh
+build/bin/Release/llama-cli -m "[PATH TO MODEL]" -ngl 100 -c 16384 -t 10 -n -2
+```
+
+**MSYS2**
+
+Install [MSYS2](https://www.msys2.org/) and then run the following commands in a UCRT terminal to install dependencies.
+```sh
+pacman -S git \
+    mingw-w64-ucrt-x86_64-gcc \
+    mingw-w64-ucrt-x86_64-cmake \
+    mingw-w64-ucrt-x86_64-vulkan-devel \
+    mingw-w64-ucrt-x86_64-shaderc \
+    mingw-w64-ucrt-x86_64-spirv-headers
+```
+
+Switch into the `llama.cpp` directory and build using CMake.
+```sh
+cmake -B build -DGGML_VULKAN=ON
+cmake --build build --config Release
+```
+
+### For Docker users:
+
+You don't need to install the Vulkan SDK. It will be installed inside the container.
+
+```sh
+# Build the image
+docker build -t llama-cpp-vulkan --target light -f .devops/vulkan.Dockerfile .
+
+# Then, use it:
+docker run -it --rm -v "$(pwd):/app:Z" --device /dev/dri/renderD128:/dev/dri/renderD128 --device /dev/dri/card1:/dev/dri/card1 llama-cpp-vulkan -m "/app/models/YOUR_MODEL_FILE" -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 33
+```
+
+### For Linux users:
+
+#### Using the LunarG Vulkan SDK
+
+First, follow the official LunarG instructions for the installation and setup of the Vulkan SDK in the [Getting Started with the Linux Tarball Vulkan SDK](https://vulkan.lunarg.com/doc/sdk/latest/linux/getting_started.html) guide.
+
+> [!IMPORTANT]
+> After completing the first step, ensure that you have used the `source` command on the `setup_env.sh` file inside of the Vulkan SDK in your current terminal session. Otherwise, the build won't work. Additionally, if you close out of your terminal, you must perform this step again if you intend to perform a build. However, there are ways to make this persistent. Refer to the Vulkan SDK guide linked in the first step for more information about any of this.
+
+#### Using system packages
+
+On Debian / Ubuntu, you can install the required dependencies using:
+```sh
+sudo apt-get install libvulkan-dev glslc spirv-headers
+```
+
+SPIRV-Headers (`spirv/unified1/spirv.hpp`) are required for the Vulkan backend and are **not** always pulled in by the Vulkan loader dev package alone. Other distros use names such as `spirv-headers` (Ubuntu / Debian / Arch), or `spirv-headers-devel` (Fedora / openSUSE). On Windows, the LunarG Vulkan SDK’s `Include` directory already contains these headers.
+
+#### Common steps
+
+Second, after verifying that you have followed all of the SDK installation/setup steps, use this command to make sure before proceeding:
+```bash
+vulkaninfo
+```
+
+Then, assuming you have `cd` into your llama.cpp folder and there are no errors with running `vulkaninfo`, you can proceed to build llama.cpp using the CMake commands below:
+```bash
+cmake -B build -DGGML_VULKAN=1
+cmake --build build --config Release
+```
+
+Finally, after finishing your build, you should be able to do something like this:
+```bash
+# Test the output binary
+# "-ngl 99" should offload all of the layers to GPU for most (if not all) models.
+./build/bin/llama-cli -m "PATH_TO_MODEL" -p "Hi you how are you" -ngl 99
+
+# You should see in the output, ggml_vulkan detected your GPU. For example:
+# ggml_vulkan: Using Intel(R) Graphics (ADL GT2) | uma: 1 | fp16: 1 | warp size: 32
+```
+
+### For Mac users:
+
+Generally, follow LunarG's [Getting Started with the MacOS Vulkan SDK](https://vulkan.lunarg.com/doc/sdk/latest/mac/getting_started.html) guide for installation and setup of the Vulkan SDK. There are two options of Vulkan drivers on macOS, both of which implement translation layers to map Vulkan to Metal. They can be hot-swapped by setting the `VK_ICD_FILENAMES` environment variable to point to the respective ICD JSON file.
+
+Check the box for "KosmicKrisp" during the LunarG Vulkan SDK installation.
+
+Set environment variable for the LunarG Vulkan SDK after installation (and optionally add to your shell profile for persistence):
+```bash
+source /path/to/vulkan-sdk/setup-env.sh
+```
+
+#### Using MoltenVK
+
+MoltenVK is the default Vulkan driver installed with the LunarG Vulkan SDK on macOS, so you can use the above environment variable settings as is.
+
+#### Using KosmicKrisp
+
+Override the environment variable for KosmicKrisp:
+```bash
+export VK_ICD_FILENAMES=$VULKAN_SDK/share/vulkan/icd.d/libkosmickrisp_icd.json
+export VK_DRIVER_FILES=$VULKAN_SDK/share/vulkan/icd.d/libkosmickrisp_icd.json
+```
+
+#### Build
+
+This is the only step different from [above](#common-steps) instructions.
+```bash
+cmake -B build -DGGML_VULKAN=1 -DGGML_METAL=OFF
+cmake --build build --config Release
+```
+
+## CANN
+This provides NPU acceleration using the AI cores of your Ascend NPU. And [CANN](https://www.hiascend.com/en/software/cann) is a hierarchical APIs to help you to quickly build AI applications and service based on Ascend NPU.
+
+For more information about Ascend NPU in [Ascend Community](https://www.hiascend.com/en/).
+
+Make sure to have the CANN toolkit installed. You can download it from here: [CANN Toolkit](https://www.hiascend.com/developer/download/community/result?module=cann)
+
+Go to `llama.cpp` directory and build using CMake.
+```bash
+cmake -B build -DGGML_CANN=on -DCMAKE_BUILD_TYPE=release
+cmake --build build --config release
+```
+
+You can test with:
+
+```bash
+./build/bin/llama-cli -m PATH_TO_MODEL -p "Building a website can be done in 10 steps:" -ngl 32
+```
+
+If the following info is output on screen, you are using `llama.cpp` with the CANN backend:
+```bash
+llm_load_tensors:       CANN model buffer size = 13313.00 MiB
+llama_init_from_model:       CANN compute buffer size =  1260.81 MiB
+```
+
+For detailed info, such as model/device supports, CANN install, please refer to [llama.cpp for CANN](./backend/CANN.md).
+
+## ZenDNN
+
+ZenDNN provides optimized deep learning primitives for AMD EPYC™ CPUs. It accelerates matrix multiplication operations for inference workloads.
+
+### Compilation
+
+- Using `CMake` on Linux (automatic build):
+
+    ```bash
+    cmake -B build -DGGML_ZENDNN=ON
+    cmake --build build --config Release
+    ```
+
+    The first build will automatically download and build ZenDNN, which may take 5-10 minutes. Subsequent builds will be much faster.
+
+- Using `CMake` with custom ZenDNN installation:
+
+    ```bash
+    cmake -B build -DGGML_ZENDNN=ON -DZENDNN_ROOT=/path/to/zendnn/install
+    cmake --build build --config Release
+    ```
+
+### Testing
+
+You can test with:
+
+```bash
+./build/bin/llama-cli -m PATH_TO_MODEL -p "Building a website can be done in 10 steps:" -n 50
+```
+
+For detailed information about hardware support, setup instructions, and performance optimization, refer to [llama.cpp for ZenDNN](./backend/ZenDNN.md).
+
+## Arm® KleidiAI™
+KleidiAI provides optimized Arm CPU microkernels used by the ggml CPU backend. Enabling it at build time makes those kernels available; it does not force every operation to use KleidiAI. At runtime, llama.cpp selects the best compatible CPU kernel from the detected CPU features, tensor type, operation shape, and active backend priority.
+
+Supported targets:
+
+| Platform | Supported ABI / architecture | Notes |
+| --- | --- | --- |
+| Linux | AArch64 / arm64 | Runtime CPU feature detection is automatic. |
+| Android | `arm64-v8a` | Use the Android NDK command below for a portable build. |
+| Apple | arm64 | Runtime CPU feature detection is automatic. Non-streaming SVE vector length is treated as unavailable. |
+| Windows | arm64 | Runtime CPU feature detection is automatic. SMCU count is treated as unknown until a detection path is verified. |
+
+`GGML_CPU_KLEIDIAI=ON` is valid only for AArch64/arm64 builds. Do not enable it for x86, 32-bit Arm, or Android ABIs other than `arm64-v8a`.
+
+### Native AArch64/arm64 build
+
+From the llama.cpp source directory:
+
+```bash
+cmake -S . -B build -DGGML_CPU_KLEIDIAI=ON
+cmake --build build --config Release
+```
+
+### Android arm64-v8a NDK build
+
+Set `ANDROID_NDK` to the Android NDK root, then run the following from the llama.cpp source directory. This command configures a portable Android `arm64-v8a` build with KleidiAI enabled and avoids Android dependencies that are not part of the NDK stable native API set.
+
+```bash
+cmake -S . -B build-android \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-28 \
+  -DGGML_CPU_KLEIDIAI=ON \
+  -DGGML_NATIVE=OFF \
+  -DGGML_OPENMP=OFF \
+  -DGGML_LLAMAFILE=OFF \
+  -DLLAMA_OPENSSL=OFF
+cmake --build build-android --config Release --parallel
+cmake --install build-android --prefix {install-dir} --config Release
+```
+
+Important Android options:
+
+- `GGML_CPU_KLEIDIAI=ON` enables KleidiAI for Android `arm64-v8a`.
+- `GGML_NATIVE=OFF` is required for cross-compilation because the build host CPU is not the Android target CPU.
+- `GGML_OPENMP=OFF` avoids adding an OpenMP runtime dependency to this NDK command-line build.
+- `GGML_LLAMAFILE=OFF` avoids the llamafile backend, which is not supported on Android.
+- `LLAMA_OPENSSL=OFF` avoids depending on OpenSSL, which is not part of the Android NDK stable native API set.
+
+The Android Studio project under `examples/llama.android` enables KleidiAI automatically for `arm64-v8a`. For Android command-line CMake builds on `arm64-v8a`, pass `-DGGML_CPU_KLEIDIAI=ON` explicitly.
+
+Global -march flags such as `-march=armv8.7a` flag are not required for a portable Android `arm64-v8a` build. Global `-march` flags raise the baseline instruction set for generic code. No manual architecture-specific source selection is required; llama.cpp selects compatible KleidiAI kernels at runtime. The KleidiAI libraries internal CMake handles the -march flags for each particular kernel.
+
+### Verifying the build
+
+Run an installed or in-tree binary:
+
+```bash
+./build/bin/llama-cli -m PATH_TO_MODEL -p "What is a car?"
+```
+
+If KleidiAI is enabled, the output contains a line similar to:
+
+```
+load_tensors: CPU_KLEIDIAI model buffer size =  3474.00 MiB
+```
+
+This confirms that the model has tensors allocated through the KleidiAI CPU buffer. It does not prove that every operation, or any specific SME-family operation, used a KleidiAI microkernel. Runtime CPU features, tensor type, operation shape, and backend priority still control dispatch.
+
+Depending on the build target, another backend may have higher priority than the CPU backend. To force CPU execution for a run, disable higher priority backends at build time, for example `-DGGML_METAL=OFF`, or use a runtime device option such as `--device none` where supported.
+
+### Runtime dispatch
+
+KleidiAI microkernels use Arm CPU features such as dotprod, i8mm, SVE, and SME/SME2. Build-time configuration makes the kernels available. Runtime dispatch selects a compatible kernel for the detected CPU and operation. Older or lower-feature CPUs fall back automatically to compatible kernels.
+
+KleidiAI accelerates selected `GGML_OP_MUL_MAT` paths for F32 and common quantized formats. Exact coverage depends on the bundled KleidiAI version and the llama.cpp runtime selector, so unsupported tensor types, unsupported operation shapes, or higher priority backends may bypass KleidiAI even when the CPU supports the required Arm feature. This is also why a model may not use SME-family kernels on SME-capable hardware.
+
+The current llama.cpp KleidiAI SVE selector only enables SVE kernels when the runtime SVE vector length is known to be QK8_0 bytes, currently 32 bytes. Linux and Android query this at runtime. Apple reports SVE capability separately from userspace non-streaming SVE availability, so llama.cpp treats the SVE vector length as unknown there. Windows exposes SVE feature presence but not the runtime SVE vector length used by this selector, so that value is also treated as unknown. Windows arm64 also treats SMCU count as unknown until a detection mechanism is verified.
+
+The set of available SME-family kernels depends on the bundled KleidiAI version and the detected CPU capabilities. Production configuration does not require any KleidiAI runtime environment variables.
+
+### Diagnostics and debug overrides
+
+KleidiAI runtime environment variables are diagnostics/debug overrides, not production configuration. Leave them unset for normal use.
+
+`GGML_KLEIDIAI_SME` controls SME-family kernel selection and overrides the maximum number of threads assigned to selected quantized SME-family kernels:
+
+- Not set: use automatic runtime detection.
+- `0`: disable SME-family kernels.
+- `<n> > 0`: enable compatible SME-family kernels and allow up to `<n>` threads for quantized SME-family kernels.
+
+On Windows arm64, use `GGML_KLEIDIAI_SME=<n>` as the temporary diagnostics/debug override for SME thread-cap calibration until automatic SMCU count detection is verified.
+
+If the CPU does not support the required SME-family capability for a bundled kernel, that kernel is disabled regardless of the environment variable.
+
+## OpenCL
+
+This provides GPU acceleration through OpenCL on recent Adreno GPU.
+More information about OpenCL backend can be found in [OPENCL.md](./backend/OPENCL.md) for more information.
+
+### Android
+
+Assume NDK is available in `$ANDROID_NDK`. First, install OpenCL headers and ICD loader library if not available,
+
+```sh
+mkdir -p ~/dev/llm
+cd ~/dev/llm
+
+git clone https://github.com/KhronosGroup/OpenCL-Headers && \
+cd OpenCL-Headers && \
+cp -r CL $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include
+
+cd ~/dev/llm
+
+git clone https://github.com/KhronosGroup/OpenCL-ICD-Loader && \
+cd OpenCL-ICD-Loader && \
+mkdir build_ndk && cd build_ndk && \
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+  -DOPENCL_ICD_LOADER_HEADERS_DIR=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=24 \
+  -DANDROID_STL=c++_shared && \
+ninja && \
+cp libOpenCL.so $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android
+```
+
+Then build llama.cpp with OpenCL enabled,
+
+```sh
+cd ~/dev/llm
+
+git clone https://github.com/ggml-org/llama.cpp && \
+cd llama.cpp && \
+mkdir build-android && cd build-android
+
+cmake .. -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-28 \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DGGML_OPENCL=ON
+
+ninja
+```
+
+### Windows Arm64
+
+First, install OpenCL headers and ICD loader library if not available,
+
+```powershell
+mkdir -p ~/dev/llm
+
+cd ~/dev/llm
+git clone https://github.com/KhronosGroup/OpenCL-Headers && cd OpenCL-Headers
+mkdir build && cd build
+cmake .. -G Ninja `
+  -DBUILD_TESTING=OFF `
+  -DOPENCL_HEADERS_BUILD_TESTING=OFF `
+  -DOPENCL_HEADERS_BUILD_CXX_TESTS=OFF `
+  -DCMAKE_INSTALL_PREFIX="$HOME/dev/llm/opencl"
+cmake --build . --target install
+
+cd ~/dev/llm
+git clone https://github.com/KhronosGroup/OpenCL-ICD-Loader && cd OpenCL-ICD-Loader
+mkdir build && cd build
+cmake .. -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_PREFIX_PATH="$HOME/dev/llm/opencl" `
+  -DCMAKE_INSTALL_PREFIX="$HOME/dev/llm/opencl"
+cmake --build . --target install
+```
+
+Then build llama.cpp with OpenCL enabled,
+
+```powershell
+cmake .. -G Ninja `
+  -DCMAKE_TOOLCHAIN_FILE="$HOME/dev/llm/llama.cpp/cmake/arm64-windows-llvm.cmake" `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_PREFIX_PATH="$HOME/dev/llm/opencl" `
+  -DBUILD_SHARED_LIBS=OFF `
+  -DGGML_OPENCL=ON
+ninja
+```
+
+## Android
+
+To read documentation for how to build on Android, [click here](./android.md)
+
+## WebGPU
+
+The WebGPU backend relies on [Dawn](https://dawn.googlesource.com/dawn). Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/main/docs/quickstart-cmake.md) to install Dawn locally so that llama.cpp can find it using CMake. The current implementation is up-to-date with Dawn commit `94c3c9c`.
+
+In the llama.cpp directory, build with CMake:
+
+```
+cmake -B build -DGGML_WEBGPU=ON
+cmake --build build --config Release
+```
+
+### Browser Support
+
+WebGPU allows cross-platform access to the GPU from supported browsers. We utilize [Emscripten](https://emscripten.org/) to compile ggml's WebGPU backend to WebAssembly. Emscripten does not officially support WebGPU bindings yet, but Dawn currently maintains its own WebGPU bindings called emdawnwebgpu.
+
+Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/main/src/emdawnwebgpu/) to download or build the emdawnwebgpu package (Note that it might be safer to build the emdawnwebgpu package locally, so that it stays in sync with the version of Dawn you have installed above). When building using CMake, the path to the emdawnwebgpu port file needs to be set with the flag `EMDAWNWEBGPU_DIR`.
+
+## WASI
+
+Requires [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) 34+ with `WASI_SDK_PATH` set. Only the libraries build (`llama-common` does not support WASI yet), so link your program against them:
+
+```bash
+FLAGS="-msimd128 -D_WASI_EMULATED_SIGNAL -fwasm-exceptions -mllvm -wasm-use-legacy-eh=false"
+cmake -B build-wasi -DCMAKE_TOOLCHAIN_FILE=$WASI_SDK_PATH/share/cmake/wasi-sdk-p2.cmake \
+    -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS" -DCMAKE_HAVE_LIBC_PTHREAD=1 \
+    -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_BUILD_COMMON=OFF
+cmake --build build-wasi --target llama
+
+$WASI_SDK_PATH/bin/clang++ --target=wasm32-wasip3 -O3 $FLAGS -I include -I ggml/include examples/simple/simple.cpp \
+    build-wasi/src/libllama.a build-wasi/ggml/src/libggml*.a -lunwind -ldl -Wl,-z,stack-size=8388608 -o llama-simple.wasm
+wasmtime run -W exceptions=y --dir models llama-simple.wasm -m models/model.gguf "Hello"
+```
+
+### wasi:webgpu
+
+The WebGPU backend can target [wasi:webgpu](https://github.com/WebAssembly/wasi-webgpu) via [wasi-webgpu-headers](https://github.com/wasi-gfx/wasi-webgpu-headers) (with its submodule) and Dawn's `dawn-headers` release. Point `Dawn_DIR` at a directory containing this `DawnConfig.cmake` next to both:
+
+```cmake
+set(_wasi_webgpu "${CMAKE_CURRENT_LIST_DIR}/wasi-webgpu-headers")
+add_library(dawn::webgpu_dawn INTERFACE IMPORTED)
+set_target_properties(dawn::webgpu_dawn PROPERTIES
+    INTERFACE_SOURCES "${_wasi_webgpu}/webgpu.c;${_wasi_webgpu}/async_futures.c;${_wasi_webgpu}/imports.c;${_wasi_webgpu}/imports_component_type.o"
+    INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/dawn-headers/include/webgpu_upstream;${_wasi_webgpu}")
+```
+
+Then build as above, but with `wasi-sdk-p3.cmake` / `--target=wasm32-wasip3`, `-DGGML_WEBGPU=ON -DDawn_DIR=...` at configure, and `build-wasi/ggml/src/ggml-webgpu/libggml-webgpu.a` added at link. See `.github/workflows/build-wasi.yml` for a more complete example.
+
+## IBM Z & LinuxONE
+
+To read documentation for how to build on IBM Z & LinuxONE, [click here](./build-s390x.md)
+
+## OpenVINO
+
+[OpenVINO](https://docs.openvino.ai/) is an open-source toolkit for optimizing and deploying high-performance AI inference, specifically designed for Intel hardware (CPUs, GPUs, and NPUs).
+
+For build instructions and usage examples, refer to [OPENVINO.md](backend/OPENVINO.md).
+
+### Hexagon
+
+Check [README.md](./backend/snapdragon/README.md) for target specific build and run info.
+
+---
+## Notes about GPU-accelerated backends
+
+The GPU may still be used to accelerate some parts of the computation even when using the `-ngl 0` option. You can fully disable GPU acceleration by using `--device none`.
+
+In most cases, it is possible to build and use multiple backends at the same time. For example, you can build llama.cpp with both CUDA and Vulkan support by using the `-DGGML_CUDA=ON -DGGML_VULKAN=ON` options with CMake. At runtime, you can specify which backend devices to use with the `--device` option. To see a list of available devices, use the `--list-devices` option.
+
+Backends can be built as dynamic libraries that can be loaded dynamically at runtime. This allows you to use the same llama.cpp binary on different machines with different GPUs. To enable this feature, use the `GGML_BACKEND_DL` option when building.
+# llama.cpp for SYCL
+
+- [Background](#background)
+- [Recommended Release](#recommended-release)
+- [News](#news)
+- [OS](#os)
+- [Hardware](#hardware)
+- [Performance Reference](#performance-reference)
+- [Docker](#docker)
+- [Linux](#linux)
+- [Windows](#windows-1)
+- [Environment Variable](#environment-variable)
+- [Design Rule](#design-rule)
+- [Known Issue](#known-issues)
+- [Q&A](#qa)
+- [TODO](#todo)
+
+## Background
+
+**SYCL** is a high-level parallel programming model designed to improve developers productivity writing code across various hardware accelerators such as CPUs, GPUs, and FPGAs. It is a single-source language designed for heterogeneous computing and based on standard C++17.
+
+**oneAPI** is an open ecosystem and a standard-based specification, supporting multiple architectures including but not limited to Intel CPUs, GPUs and FPGAs. The key components of the oneAPI ecosystem include:
+
+- **DPCPP** *(Data Parallel C++)*: The primary oneAPI SYCL implementation, which includes the icpx/icx Compilers.
+- **oneAPI Libraries**: A set of highly optimized libraries targeting multiple domains *(e.g. Intel oneMKL, oneMath and oneDNN)*.
+- **oneAPI LevelZero**: A high performance low level interface for fine-grained control over Intel iGPUs and dGPUs.
+
+### Llama.cpp + SYCL
+
+The llama.cpp SYCL backend is primarily designed for **Intel GPUs**.
+SYCL cross-platform capabilities enable support for other vendor GPUs as well.
+
+## Recommended Release
+
+### Windows
+
+The following releases are verified and recommended:
+
+|Commit ID|Tag|Release|Verified  Platform| Update date|
+|-|-|-|-|-|
+|24e86cae7219b0f3ede1d5abdf5bf3ad515cccb8|b5377 |[llama-b5377-bin-win-sycl-x64.zip](https://github.com/ggml-org/llama.cpp/releases/download/b5377/llama-b5377-bin-win-sycl-x64.zip) |Arc B580/Linux/oneAPI 2025.1<br>LNL Arc GPU/Windows 11/oneAPI 2025.1.1|2025-05-15|
+|3bcd40b3c593d14261fb2abfabad3c0fb5b9e318|b4040 |[llama-b4040-bin-win-sycl-x64.zip](https://github.com/ggml-org/llama.cpp/releases/download/b4040/llama-b4040-bin-win-sycl-x64.zip) |Arc A770/Linux/oneAPI 2024.1<br>MTL Arc GPU/Windows 11/oneAPI 2024.1| 2024-11-19|
+|fb76ec31a9914b7761c1727303ab30380fd4f05c|b3038 |[llama-b3038-bin-win-sycl-x64.zip](https://github.com/ggml-org/llama.cpp/releases/download/b3038/llama-b3038-bin-win-sycl-x64.zip) |Arc A770/Linux/oneAPI 2024.1<br>MTL Arc GPU/Windows 11/oneAPI 2024.1||
+
+### Ubuntu 24.04
+
+The release packages for Ubuntu 24.04 x64 (FP32/FP16) only include the binary files of the llama.cpp SYCL backend. They require the target machine to have pre-installed Intel GPU drivers and oneAPI packages that are the same version as the build package. To get the version and installation info, refer to [.github/workflows/release.yml#L713](../../.github/workflows/release.yml#L713): ubuntu-24-sycl -> Download & Install oneAPI.
+
+It is recommended to use them with [Intel Docker](https://hub.docker.com/r/intel/deep-learning-essentials).
+
+The packages for FP32 and FP16 would have different accuracy and performance on LLMs. Please choose it according to the test result.
+
+## News
+
+- 2026.11
+  - Update the CI and release build for oneAPI 2026.2 and Level Zero SDK 1.34.0. oneDNN is updated to the 2026.1 stand-alone package.
+
+- 2026.09
+  - Update the CI build environment for oneAPI 2026.1 (unified oneAPI Toolkit). oneDNN is removed from the Deep Learning Essentials package in 2026.0, so the CI now uses the oneAPI Toolkit installer which still includes oneDNN.
+  - oneAPI 2026.1 improves the SYCL build performance: measured with the same code on Arc B570, prompt processing 1331 vs 434 t/s (3.1x) vs the 2025.3-based release build.
+
+- 2026.04-05
+  - Optimize mul_mat by reorder feature for data type: Q4_K, Q5_K, Q6_K, Q8_0.
+  - Fused MoE.
+  - Upgrate CI and built package for oneAPI 2025.3.3, support Ubuntu 24.04 built package.
+
+- 2026.03
+  - Support Flash-Attention: less memory usage, performance impact depends on LLM.
+
+- 2026.02
+  - Remove support for Nvidia & AMD GPU, because the oneAPI plugin for Nvidia & AMD GPU is unavailable: download/installation channels are out of work. User can't build up the software for Nvidia & AMD GPU.
+
+- 2025.11
+  - Support malloc memory on device more than 4GB.
+
+- 2025.2
+  - Optimize MUL_MAT Q4_0 on Intel GPU for all dGPUs and built-in GPUs since MTL. Increase the performance of LLM (llama-2-7b.Q4_0.gguf) 21%-87% on Intel GPUs (MTL, ARL-H, Arc, Flex, PVC).
+    |GPU|Base tokens/s|Increased tokens/s|Percent|
+    |-|-|-|-|
+    |PVC 1550|39|73|+87%|
+    |Flex 170|39|50|+28%|
+    |Arc A770|42|55|+30%|
+    |MTL|13|16|+23%|
+    |ARL-H|14|17|+21%|
+
+- 2024.11
+  - Use syclcompat to improve the performance on some platforms. This requires to use oneAPI 2025.0 or newer.
+
+- 2024.8
+  - Use oneDNN as the default GEMM library, improve the compatibility for new Intel GPUs.
+
+- 2024.5
+  - Performance is increased: 34 -> 37 tokens/s of llama-2-7b.Q4_0 on Arc A770.
+  - Arch Linux is verified successfully.
+
+- 2024.4
+  - Support data types: GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M.
+
+- 2024.3
+  - Release binary files of Windows.
+  - A blog is published: **Run LLM on all Intel GPUs Using llama.cpp**: [intel.com](https://www.intel.com/content/www/us/en/developer/articles/technical/run-llm-on-all-gpus-using-llama-cpp-artical.html) or [medium.com](https://medium.com/@jianyu_neo/run-llm-on-all-intel-gpus-using-llama-cpp-fd2e2dcbd9bd).
+  - New base line is ready: [tag b2437](https://github.com/ggml-org/llama.cpp/tree/b2437).
+  - Support multiple cards: **--split-mode**: [none|layer]; not support [row], it's on developing.
+  - Support to assign main GPU by **--main-gpu**, replace $GGML_SYCL_DEVICE.
+  - Support detecting all GPUs with level-zero and same top **Max compute units**.
+  - Support OPs
+    - hardsigmoid
+    - hardswish
+    - pool2d
+
+- 2024.1
+  - Create SYCL backend for Intel GPU.
+  - Support Windows build
+
+## OS
+
+| OS      | Status  | Verified                                       |
+|---------|---------|------------------------------------------------|
+| Linux   | Support | Ubuntu 22.04, Fedora Silverblue 39, Arch Linux |
+| Windows | Support | Windows 11                                     |
+
+
+## Hardware
+
+### Intel GPU
+
+SYCL backend supports Intel GPU Family:
+
+- Intel Data Center Max Series
+- Intel Flex Series, Arc Series
+- Intel Built-in Arc GPU
+- Intel iGPU in Core CPU (11th Generation Core CPU and newer, refer to [oneAPI supported GPU](https://www.intel.com/content/www/us/en/developer/articles/system-requirements/intel-oneapi-base-toolkit-system-requirements.html#inpage-nav-1-1)).
+
+On older Intel GPUs, you may try [OpenCL](/docs/backend/OPENCL.md) although the performance is not optimal, and some GPUs may not support OpenCL nor have any GPGPU capabilities.
+
+#### Verified devices
+
+| Intel GPU                     | Status  | Verified Model                        |
+|-------------------------------|---------|---------------------------------------|
+| Intel Data Center Max Series  | Support | Max 1550, 1100                        |
+| Intel Data Center Flex Series | Support | Flex 170                              |
+| Intel Arc A-Series            | Support | Arc A770, Arc A730M, Arc A750         |
+| Intel Arc B-Series            | Support | Arc B580                              |
+| Intel built-in Arc GPU        | Support | built-in Arc GPU in Meteor Lake, Arrow Lake, Lunar Lake |
+| Intel iGPU                    | Support | iGPU in 13700k, 13400, i5-1250P, i7-1260P, i7-1165G7  |
+
+*Notes:*
+
+- **Memory**
+  - The device memory is a limitation when running a large model. The loaded model size, *`llm_load_tensors: buffer_size`*, is displayed in the log when running `./bin/llama-completion`.
+  - Please make sure the GPU shared memory from the host is large enough to account for the model's size. For e.g. the *llama-2-7b.Q4_0* requires at least 8.0GB for integrated GPU and 4.0GB for discrete GPU.
+
+- **Execution Unit (EU)**
+  - If the iGPU has less than 80 EUs, the inference speed will likely be too slow for practical use.
+
+### Other Vendor GPU
+
+NA
+
+## Performance Reference
+
+
+To get the supported LLMs, GPUs, and performance reference, please check [Performance of llama.cpp on Intel GPU with SYCL backend](https://github.com/ggml-org/llama.cpp/discussions/23313).
+
+You could update your test result in it directly.
+
+## Docker
+
+Please refer to [Docker with SYCL](../docker.md#docker-with-sycl) for details.
+
+## Quick Development WOW
+
+This chapter is for quick development & try with SYCL backend on Intel GPU.
+
+You need to install following sofeware before development:
+   - Intel GPU driver
+   - oneAPI package
+   - other development tools.
+
+Please refer to [Linux](#linux) or [Windows](#windows-1) for above installation and resolve the trouble in usage. There are the detailed guide.
+
+- Linux
+
+```
+## build from source code
+./examples/sycl/build.sh
+
+## run CONV_2D_DW unit test cases
+./build/bin/test-backend-ops -b SYCL0 -o CONV_2D_DW
+
+## run all unit test cases
+./build/bin/test-backend-ops -b SYCL0
+
+## run with LLM on the first GPU
+./examples/sycl/test.sh -mg 0 -m xxxx.gguf
+
+## run service with LLM on the first GPU
+export ONEAPI_DEVICE_SELECTOR="level_zero:0"
+./examples/sycl/start-svr.sh -m xxxx.gguf
+
+## update the docs/ops.md for new/update OPs
+./examples/sycl/update-ops-doc.sh
+```
+
+- Windows
+
+```
+## build from source code
+examples\sycl\win-build-sycl.bat
+
+## run CONV_2D_DW unit test cases
+build\bin\test-backend-ops.exe -b SYCL0 -o CONV_2D_DW
+
+## run all unit test cases
+build\bin\test-backend-ops.exe -b SYCL0
+
+## run LLM on the first GPU
+examples\sycl\win-test.bat -mg 0 -m xxxx.gguf
+
+## run service with LLM on the first GPU
+set ONEAPI_DEVICE_SELECTOR="level_zero:0"
+examples\sycl\win-start-svr.bat -m xxxx.gguf
+
+## update the docs/ops.md for new/update OPs
+examples\sycl\win-update-ops-doc.bat
+```
+
+
+## Linux
+
+### I. Setup Environment
+
+1. **Install GPU drivers**
+
+  - **Intel GPU**
+
+Intel data center GPUs drivers installation guide and download page can be found here: [Get Intel dGPU Drivers](https://dgpu-docs.intel.com/driver/installation.html#ubuntu-install-steps).
+
+*Note*: for client GPUs *(iGPU & Arc A-Series)*, please refer to the [client iGPU driver installation](https://dgpu-docs.intel.com/driver/client/overview.html).
+
+Once installed, add the user(s) to the `video` and `render` groups.
+
+```sh
+sudo usermod -aG render $USER
+sudo usermod -aG video $USER
+```
+
+*Note*: logout/re-login for the changes to take effect.
+
+Verify installation through `clinfo`:
+
+```sh
+sudo apt install clinfo
+sudo clinfo -l
+```
+
+Sample output:
+
+```sh
+Platform #0: Intel(R) OpenCL Graphics
+ `-- Device #0: Intel(R) Arc(TM) A770 Graphics
+
+Platform #0: Intel(R) OpenCL HD Graphics
+ `-- Device #0: Intel(R) Iris(R) Xe Graphics [0x9a49]
+```
+
+2. **Install Intel® oneAPI Toolkit**
+
+SYCL backend depends on:
+  - Intel® oneAPI DPC++/C++ compiler/running-time.
+  - Intel® oneAPI DPC++/C++ library (oneDPL).
+  - Intel® oneAPI Deep Neural Network Library (oneDNN).
+  - Intel® oneAPI Math Kernel Library (oneMKL).
+
+- **For Intel GPU**
+
+With the 2026.0 release, the Intel® oneAPI Base toolkit and the HPC toolkit are combined into the **Intel® oneAPI Toolkit**, and **oneDNN is removed from the Intel® Deep Learning Essentials** package (oneDNN is distributed separately since then). The **Intel® oneAPI Toolkit** includes oneDNN until 2027.0.
+
+It's recommended to install the **Intel® oneAPI Toolkit**. This includes all dependencies for the SYCL backend.
+
+The **Intel® oneAPI Toolkit** can be obtained from the official [Intel® oneAPI Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html) page.
+
+Please follow the instructions for downloading and installing the Toolkit for Linux, and preferably keep the default installation values unchanged, notably the installation path *(`/opt/intel/oneapi` by default)*.
+
+Following guidelines/code snippets assume the default installation values. Otherwise, please make sure the necessary changes are reflected where applicable.
+
+Upon a successful installation, SYCL is enabled for the available Intel devices, along with relevant libraries such as oneAPI oneDNN for Intel GPUs.
+
+|Verified release|
+|-|
+|2026.2 |
+|2026.1 |
+|2025.3.3 |
+|2025.2.1|
+|2025.1|
+|2024.1|
+
+3. **Verify installation and environment**
+
+In order to check the available SYCL devices on the machine, please use the `sycl-ls` command.
+```sh
+source /opt/intel/oneapi/setvars.sh
+sycl-ls
+```
+
+- **Intel GPU**
+
+When targeting an intel GPU, the user should expect one or more devices among the available SYCL devices. Please make sure that at least one GPU is present via `sycl-ls`, for instance `[level_zero:gpu]` in the sample output below:
+
+```
+[level_zero:gpu][level_zero:0] Intel(R) oneAPI Unified Runtime over Level-Zero, Intel(R) Arc(TM) A770 Graphics 12.55.8 [1.3.29735+27]
+[level_zero:gpu][level_zero:1] Intel(R) oneAPI Unified Runtime over Level-Zero, Intel(R) UHD Graphics 730 12.2.0 [1.3.29735+27]
+[opencl:cpu][opencl:0] Intel(R) OpenCL, 13th Gen Intel(R) Core(TM) i5-13400 OpenCL 3.0 (Build 0) [2025.20.8.0.06_160000]
+[opencl:gpu][opencl:1] Intel(R) OpenCL Graphics, Intel(R) Arc(TM) A770 Graphics OpenCL 3.0 NEO  [24.39.31294]
+[opencl:gpu][opencl:2] Intel(R) OpenCL Graphics, Intel(R) UHD Graphics 730 OpenCL 3.0 NEO  [24.39.31294]
+```
+
+### II. Build llama.cpp
+
+HTTPS downloads, including Hugging Face models, require OpenSSL development libraries at build time. See the [build prerequisites](../build.md) for installation commands. If OpenSSL is not found, the build can still complete without HTTPS support.
+
+#### Intel GPU
+
+```sh
+# Uses FP32, consider using FP16 for better performance in most cases
+./examples/sycl/build.sh
+```
+
+or
+
+```sh
+# Export relevant ENV variables
+source /opt/intel/oneapi/setvars.sh
+
+# Option 1: Use FP16 (recommended for better performance in most cases)
+cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON
+
+# Option 2: Use FP32
+cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+
+# build all binary
+cmake --build build --config Release -j -v
+```
+
+It is possible to come across some precision issues when running tests that stem from using faster
+instructions, which can be circumvented by setting the environment variable `SYCL_PROGRAM_COMPILE_OPTIONS`
+as `-cl-fp32-correctly-rounded-divide-sqrt`
+
+### III. Run the inference
+
+#### Retrieve and prepare model
+
+You can refer to the general [*Obtaining and quantizing models*](../../README.md#obtaining-and-quantizing-models) guide for model preparation, or download an already quantized model like [llama-2-7b.Q4_0.gguf](https://huggingface.co/TheBloke/Llama-2-7B-GGUF/resolve/main/llama-2-7b.Q4_0.gguf?download=true) or [Meta-Llama-3-8B-Instruct-Q4_0.gguf](https://huggingface.co/aptha/Meta-Llama-3-8B-Instruct-Q4_0-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_0.gguf).
+
+##### Check device
+
+1. Enable oneAPI running environment
+
+```sh
+source /opt/intel/oneapi/setvars.sh
+```
+
+2. List devices information
+
+Similar to the native `sycl-ls`, available SYCL devices can be queried as follow:
+
+```sh
+./build/bin/llama-ls-sycl-device
+```
+
+This command will only display the selected backend that is supported by SYCL. The default backend is level_zero. For example, in a system with 2 *Intel GPU* it would look like the following:
+```
+found 2 SYCL devices:
+
+|  |                  |                                             |Compute   |Max compute|Max work|Max sub|               |
+|ID|       Device Type|                                         Name|capability|units      |group   |group  |Global mem size|
+|--|------------------|---------------------------------------------|----------|-----------|--------|-------|---------------|
+| 0|[level_zero:gpu:0]|               Intel(R) Arc(TM) A770 Graphics|       1.3|        512|    1024|     32|    16225243136|
+| 1|[level_zero:gpu:1]|                    Intel(R) UHD Graphics 770|       1.3|         32|     512|     32|    53651849216|
+```
+
+#### Choose level-zero devices
+
+|Chosen Device ID|Setting|
+|-|-|
+|0|`export ONEAPI_DEVICE_SELECTOR="level_zero:0"` or no action|
+|1|`export ONEAPI_DEVICE_SELECTOR="level_zero:1"`|
+|0 & 1|`export ONEAPI_DEVICE_SELECTOR="level_zero:0;level_zero:1"`|
+
+#### Execute
+
+Choose one of following methods to run.
+
+1. Script
+
+- Use device 0:
+
+```sh
+./examples/sycl/test.sh -mg 0
+```
+- Use multiple devices:
+
+```sh
+./examples/sycl/test.sh
+```
+
+- Run llama-server:
+
+```sh
+./examples/sycl/start-svr.sh -m PATH/MODEL_FILE
+```
+
+2. Command line
+Launch inference
+
+There are two device selection modes:
+
+- Single device: Use one device assigned by user. Default device id is 0.
+- Multiple devices: Automatically choose the devices with the same backend.
+
+In two device selection modes, the default SYCL backend is level_zero, you can choose other backend supported by SYCL by setting environment variable ONEAPI_DEVICE_SELECTOR.
+
+| Device selection | Parameter                              |
+|------------------|----------------------------------------|
+| Single device    | --split-mode none --main-gpu DEVICE_ID |
+| Multiple devices | --split-mode layer (default)           |
+| Multiple devices | --split-mode tensor (tensor parallelism) |
+
+`--split-mode tensor` (tensor parallelism) shards each layer across the selected
+GPUs. It requires flash attention, which is auto-enabled when `--flash-attn` is
+left at its default `auto`, so `--split-mode tensor` works out of the box.
+Passing `--flash-attn off` together with `--split-mode tensor` is rejected at
+context creation. The default `f16` KV cache is recommended. Tensor parallelism
+is currently optimized for 2 GPUs; other device counts fall back to a generic
+all-reduce.
+
+Examples:
+
+- Use device 0:
+
+```sh
+ZES_ENABLE_SYSMAN=1 ./build/bin/llama-completion -no-cnv -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 99 -sm none -mg 0 --load-mode auto
+```
+
+- Use multiple devices:
+
+```sh
+ZES_ENABLE_SYSMAN=1 ./build/bin/llama-completion -no-cnv -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 99 -sm layer --load-mode auto
+```
+
+*Notes:*
+
+- Upon execution, verify the selected device(s) ID(s) in the output log, which can for instance be displayed as follow:
+
+```sh
+detect 1 SYCL GPUs: [0] with top Max compute units:512
+```
+Or
+```sh
+use 1 SYCL GPUs: [0] with Max compute units:512
+```
+
+User can use the device management in [docs/multi-gpu.md](https://github.com/ggml-org/llama.cpp/blob/master/docs/multi-gpu.md), like parameter `--device SYCL0,SYCL1` to assign one or more devices.
+
+## Windows
+
+### Install GPU driver
+
+Intel GPU drivers instructions guide and download page can be found here: [Get Intel GPU Drivers](https://www.intel.com/content/www/us/en/products/docs/discrete-gpus/arc/software/drivers.html).
+
+### Option 1: download the binary package directly
+
+Download the binary package for Windows from: https://github.com/ggml-org/llama.cpp/releases.
+
+Extract the package to local folder, run the llama tools directly. Refer to [Run the inference](#iii-run-the-inference-1).
+
+Note, the package includes the SYCL running time and all depended dll files, no need to install oneAPI package and activte them.
+
+### Option 2: build locally from the source code.
+
+#### I. Setup environment
+
+1. Install Visual Studio
+
+If you already have a recent version of Microsoft Visual Studio, you can skip this step. Otherwise, please refer to the official download page for [Microsoft Visual Studio](https://visualstudio.microsoft.com/).
+
+2. Install Intel® oneAPI Base toolkit
+
+SYCL backend depends on:
+  - Intel® oneAPI DPC++/C++ compiler/running-time.
+  - Intel® oneAPI DPC++/C++ library (oneDPL).
+  - Intel® oneAPI Deep Neural Network Library (oneDNN).
+  - Intel® oneAPI Math Kernel Library (oneMKL).
+
+All above are included in both **Intel® oneAPI Base toolkit** and **Intel® Deep Learning Essentials** packages.
+
+It's recommended to install **Intel® Deep Learning Essentials** which only provides the necessary libraries with less size.
+
+The **Intel® oneAPI Base toolkit** and **Intel® Deep Learning Essentials** can be obtained from the official [Intel® oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit.html) page.
+
+Please follow the instructions for downloading and installing the Toolkit for Windows, and preferably keep the default installation values unchanged, notably the installation path *(`C:\Program Files (x86)\Intel\oneAPI` by default)*.
+
+Following guidelines/code snippets assume the default installation values. Otherwise, please make sure the necessary changes are reflected where applicable.
+
+b. Enable oneAPI running environment:
+
+- Type "oneAPI" in the search bar, then open the `Intel oneAPI command prompt for Intel 64 for Visual Studio 2022` App.
+
+- On the command prompt, enable the runtime environment with the following:
+```
+"C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64
+```
+
+- if you are using Powershell, enable the runtime environment with the following:
+
+```
+cmd.exe "/K" '"C:\Program Files (x86)\Intel\oneAPI\setvars.bat" && powershell'
+```
+
+c. Verify installation
+
+In the oneAPI command line, run the following to print the available SYCL devices:
+
+```
+sycl-ls.exe
+```
+
+There should be one or more *level-zero* GPU devices displayed as **[ext_oneapi_level_zero:gpu]**. Below is example of such output detecting an *Intel Iris Xe* GPU as a Level-zero SYCL device:
+
+Output (example):
+```
+[opencl:acc:0] Intel(R) FPGA Emulation Platform for OpenCL(TM), Intel(R) FPGA Emulation Device OpenCL 1.2  [2023.16.10.0.17_160000]
+[opencl:cpu:1] Intel(R) OpenCL, 11th Gen Intel(R) Core(TM) i7-1185G7 @ 3.00GHz OpenCL 3.0 (Build 0) [2023.16.10.0.17_160000]
+[opencl:gpu:2] Intel(R) OpenCL Graphics, Intel(R) Iris(R) Xe Graphics OpenCL 3.0 NEO  [31.0.101.5186]
+[ext_oneapi_level_zero:gpu:0] Intel(R) Level-Zero, Intel(R) Iris(R) Xe Graphics 1.3 [1.3.28044]
+```
+
+3. Install build tools
+
+a. Download & install cmake for Windows: https://cmake.org/download/ (CMake can also be installed from Visual Studio Installer)
+b. The new Visual Studio will install Ninja as default. (If not, please install it manually: https://ninja-build.org/)
+
+
+#### II. Build llama.cpp
+
+You could download the release package for Windows directly, which including binary files and depended oneAPI dll files.
+
+Choose one of following methods to build from source code.
+
+##### Option 1: Script
+
+```sh
+# Uses FP32, consider using FP16 for better performance in most cases
+.\examples\sycl\win-build-sycl.bat
+```
+
+##### Option 2: CMake
+
+On the oneAPI command line window, step into the llama.cpp main directory and run the following:
+
+```
+@call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
+
+# Option 1: Use FP16 (recommended for better performance in most cases)
+cmake -B build -G "Ninja" -DGGML_SYCL=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL_F16=ON
+
+# Option 2: Or FP32
+cmake -B build -G "Ninja" -DGGML_SYCL=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx -DCMAKE_BUILD_TYPE=Release
+
+cmake --build build --config Release -j
+```
+
+Or, use CMake presets to build:
+
+```sh
+cmake -DGGML_SYCL_F16=ON --preset x64-windows-sycl-release
+cmake --build build-x64-windows-sycl-release -j --target llama-completion
+
+cmake --preset x64-windows-sycl-release
+cmake --build build-x64-windows-sycl-release -j --target llama-completion
+
+cmake --preset x64-windows-sycl-debug
+cmake --build build-x64-windows-sycl-debug -j --target llama-completion
+```
+
+##### Option 3: Visual Studio
+
+You have two options to use Visual Studio to build llama.cpp:
+- As CMake Project using CMake presets.
+- Creating a Visual Studio solution to handle the project.
+
+**Note**:
+
+All following commands are executed in PowerShell.
+
+###### - Open as a CMake Project
+
+You can use Visual Studio to open the `llama.cpp` folder directly as a CMake project. Before compiling, select one of the SYCL CMake presets:
+
+- `x64-windows-sycl-release`
+
+- `x64-windows-sycl-debug`
+
+*Notes:*
+- For a minimal experimental setup, you can build only the inference executable using:
+
+    ```Powershell
+    cmake --build build --config Release -j --target llama-completion
+    ```
+
+###### - Generating a Visual Studio Solution
+
+You can use Visual Studio solution to build and work on llama.cpp on Windows. You need to convert the CMake Project into a `.sln` file.
+
+If you want to use the Intel C++ Compiler for the entire `llama.cpp` project, run the following command:
+
+```Powershell
+cmake -B build -G "Visual Studio 17 2022" -T "Intel C++ Compiler 2025" -A x64 -DGGML_SYCL=ON -DCMAKE_BUILD_TYPE=Release
+```
+
+If you prefer to use the Intel C++ Compiler only for `ggml-sycl`, ensure that `ggml` and its backend libraries are built as shared libraries ( i.e. `-DBUILD_SHARED_LIBRARIES=ON`, this is default behaviour):
+
+```Powershell
+cmake -B build -G "Visual Studio 17 2022" -A x64 -DGGML_SYCL=ON -DCMAKE_BUILD_TYPE=Release \
+      -DSYCL_INCLUDE_DIR="C:\Program Files (x86)\Intel\oneAPI\compiler\latest\include" \
+      -DSYCL_LIBRARY_DIR="C:\Program Files (x86)\Intel\oneAPI\compiler\latest\lib"
+```
+
+If successful the build files have been written to: *path/to/llama.cpp/build*
+Open the project file **build/llama.cpp.sln** with Visual Studio.
+
+Once the Visual Studio solution is created, follow these steps:
+
+1. Open the solution in Visual Studio.
+
+2. Right-click on `ggml-sycl` and select **Properties**.
+
+3. In the left column, expand **C/C++** and select **DPC++**.
+
+4. In the right panel, find **Enable SYCL Offload** and set it to `Yes`.
+
+5. Apply the changes and save.
+
+
+*Navigation Path:*
+
+```
+Properties -> C/C++ -> DPC++ -> Enable SYCL Offload (Yes)
+```
+
+Now, you can build `llama.cpp` with the SYCL backend as a Visual Studio project.
+To do it from menu: `Build -> Build Solution`.
+Once it is completed, final results will be in **build/Release/bin**
+
+*Additional Note*
+
+- You can avoid specifying `SYCL_INCLUDE_DIR` and `SYCL_LIBRARY_DIR` in the CMake command by setting the environment variables:
+
+    - `SYCL_INCLUDE_DIR_HINT`
+
+    - `SYCL_LIBRARY_DIR_HINT`
+
+- Above instruction has been tested with Visual Studio 17 Community edition and oneAPI 2025.0. We expect them to work also with future version if the instructions are adapted accordingly.
+
+### III. Run the inference
+
+#### Retrieve and prepare model
+
+You can refer to the general [*Obtaining and quantizing models*](../../README.md#obtaining-and-quantizing-models) guide for model preparation, or download an already quantized model like [llama-2-7b.Q4_0.gguf](https://huggingface.co/TheBloke/Llama-2-7B-GGUF/blob/main/llama-2-7b.Q4_0.gguf) or [Meta-Llama-3-8B-Instruct-Q4_0.gguf](https://huggingface.co/aptha/Meta-Llama-3-8B-Instruct-Q4_0-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_0.gguf).
+
+##### Check device
+
+1. Enable oneAPI running environment
+
+On the oneAPI command line window, run the following and step into the llama.cpp directory:
+```
+"C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64
+```
+
+2. List devices information
+
+Similar to the native `sycl-ls`, available SYCL devices can be queried as follow:
+
+```
+build\bin\llama-ls-sycl-device.exe
+```
+
+This command will only display the selected backend that is supported by SYCL. The default backend is level_zero. For example, in a system with 2 *Intel GPU* it would look like the following:
+```
+found 2 SYCL devices:
+|  |                  |                                             |Compute   |Max compute|Max work|Max sub|               |
+|ID|       Device Type|                                         Name|capability|units      |group   |group  |Global mem size|
+|--|------------------|---------------------------------------------|----------|-----------|--------|-------|---------------|
+| 0|[level_zero:gpu:0]|               Intel(R) Arc(TM) A770 Graphics|       1.3|        512|    1024|     32|    16225243136|
+| 1|[level_zero:gpu:1]|                    Intel(R) UHD Graphics 770|       1.3|         32|     512|     32|    53651849216|
+
+```
+
+##### Choose level-zero devices
+
+|Chosen Device ID|Setting|
+|-|-|
+|0|Default option. You may also want to `set ONEAPI_DEVICE_SELECTOR="level_zero:0"`|
+|1|`set ONEAPI_DEVICE_SELECTOR="level_zero:1"`|
+|0 & 1|`set ONEAPI_DEVICE_SELECTOR="level_zero:0;level_zero:1"` or `set ONEAPI_DEVICE_SELECTOR="level_zero:*"`|
+
+##### Execute
+
+Choose one of following methods to run.
+
+1. Script
+
+- Run test:
+
+```
+examples\sycl\win-test.bat
+```
+
+- Run llama-server:
+
+```
+examples\sycl\win-start-svr.bat -m PATH\MODEL_FILE
+```
+
+2. Command line
+
+Launch inference
+
+There are two device selection modes:
+
+- Single device: Use one device assigned by user. Default device id is 0.
+- Multiple devices: Automatically choose the devices with the same backend.
+
+In two device selection modes, the default SYCL backend is level_zero, you can choose other backend supported by SYCL by setting environment variable ONEAPI_DEVICE_SELECTOR.
+
+| Device selection | Parameter                              |
+|------------------|----------------------------------------|
+| Single device    | --split-mode none --main-gpu DEVICE_ID |
+| Multiple devices | --split-mode layer (default)           |
+| Multiple devices | --split-mode tensor (tensor parallelism) |
+
+`--split-mode tensor` (tensor parallelism) shards each layer across the selected
+GPUs. It requires flash attention, which is auto-enabled when `--flash-attn` is
+left at its default `auto`, so `--split-mode tensor` works out of the box.
+Passing `--flash-attn off` together with `--split-mode tensor` is rejected at
+context creation. The default `f16` KV cache is recommended. Tensor parallelism
+is currently optimized for 2 GPUs; other device counts fall back to a generic
+all-reduce.
+
+Examples:
+
+- Use device 0:
+
+```
+build\bin\llama-completion.exe -no-cnv -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 99 -sm none -mg 0 --load-mode auto
+```
+
+- Use multiple devices:
+
+```
+build\bin\llama-completion.exe -no-cnv -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 99 -sm layer --load-mode auto
+```
+
+
+Note:
+
+- Upon execution, verify the selected device(s) ID(s) in the output log, which can for instance be displayed as follow:
+
+```sh
+detect 1 SYCL GPUs: [0] with top Max compute units:512
+```
+
+Or
+
+```sh
+use 1 SYCL GPUs: [0] with Max compute units:512
+```
+
+User can use the device management in [docs/multi-gpu.md](https://github.com/ggml-org/llama.cpp/blob/master/docs/multi-gpu.md), like parameter `--device SYCL0,SYCL1` to assign one or more devices.
+
+## Environment Variable
+
+### Build
+
+| Name               | Value                                 | Function                                    |
+|--------------------|---------------------------------------|---------------------------------------------|
+| GGML_SYCL          | ON (mandatory)                        | Enable build with SYCL code path.           |
+| GGML_SYCL_TARGET   | INTEL *(default)*                     | Set the SYCL target device type.            |
+| GGML_SYCL_DEVICE_ARCH | Optional                           | Set the SYCL device architecture. Setting the device architecture can improve the performance. See the table [--offload-arch](https://github.com/intel/llvm/blob/sycl/sycl/doc/design/OffloadDesign.md#--offload-arch) for a list of valid architectures. |
+| GGML_SYCL_F16      | OFF *(default)* \|ON *(optional)*     | Enable FP16 build with SYCL code path. [1.](#sycl-f16-footnote) |
+| GGML_SYCL_SUPPORT_XMX | ON *(default)* \|OFF *(Optional)* | Build the code paths that use XMX (DPAS) instructions. Set OFF for AOT builds targeting iGPUs without XMX, which otherwise fail to compile. |
+| GGML_SYCL_GRAPH    | ON *(default)* \|OFF *(Optional)*     | Enable build with [SYCL Graph extension](https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/experimental/sycl_ext_oneapi_graph.asciidoc). |
+| GGML_SYCL_DNN      | ON *(default)* \|OFF *(Optional)*     | Enable build with oneDNN.                   |
+| GGML_SYCL_HOST_MEM_FALLBACK | ON *(default)* \|OFF *(Optional)* | Allow host memory fallback when device memory is full during quantized weight reorder. Enables inference to continue at reduced speed (reading over PCIe) instead of failing. Requires Linux kernel 6.8+. |
+| GGML_SYCL_SUPPORT_LEVEL_ZERO_API | ON *(default)* \|OFF *(Optional)* | Support to use Level Zero API for device memory allocation. Requires Level Zero headers/library at build time and Intel GPU driver (Level Zero runtime) at run time. Reduces system RAM usage during multi-GPU inference. SYCL backend always runs on Level Zero running time even if it's set as OFF (The SYCL api will be usage for memory allocation).|
+| CMAKE_C_COMPILER   | `icx` *(Linux)*, `icx/cl` *(Windows)* | Set `icx` compiler for SYCL code path.      |
+| CMAKE_CXX_COMPILER | `icpx` *(Linux)*, `icx` *(Windows)*   | Set `icpx/icx` compiler for SYCL code path. |
+
+1. <a id="sycl-f16-footnote"></a>FP32 or FP16 have different performance impact to LLM. Recommended to test them for better prompt processing performance on your models. You need to rebuild the code after change `GGML_SYCL_F16=OFF/ON`.
+
+### Runtime
+
+| Name              | Value            | Function                                                                                                                  |
+|-------------------|------------------|---------------------------------------------------------------------------------------------------------------------------|
+| GGML_SYCL_DEBUG   | 0 (default) or 1 | Enable log function: GGML_SYCL_DEBUG() for common debug. |
+| GGML_SYCL_DEV_DEBUG   | 0 (default) or 1 | Enable log function: GGML_SYCL_DEV_DEBUG() for developmental purposes by replacing GGML_SYCL_DEBUG() in special codes. Restore to GGML_SYCL_DEBUG() before committing code.|
+| GGML_SYCL_DEV2DEV_MEMCPY | 0 (default), 1, 2 | Choose the method of dev2dev memory copy.<br>Value: <br>*  0: SYCL API (default), only support dGPUs.<br>* 1: L0 API -- Better performance, only support dGPUs, found to lead to abnormal crash in some case. <br>* 2: Host Forward -- Most stable method for all cases (including iGPU + dGPU*N), but with lower performance (-2% to -5%).<br>SYCL & L0 API are easy to be impacted by Intel GPU driver issue. When you meet the garbled output or crash issues in multiple GPUs case, try with this debug flag to work around or check the issue.|
+| GGML_SYCL_ENABLE_FLASH_ATTN | 1 (default) or 0| Enable Flash-Attention. It can reduce memory usage. The performance impact depends on the LLM.|
+| GGML_SYCL_ENABLE_OPT | 0 or 1 (default)| Enable optimize features for Intel GPUs. (Recommended to 0 for Intel devices older than Gen 10) |
+| GGML_SYCL_ENABLE_GRAPH | 0 (default) or 1 | Enable running computations through SYCL Graphs feature. Disabled by default because SYCL Graph is still in development, performance depends on model and device. [1.](#sycl-graph-footnote) |
+| GGML_SYCL_GRAPH_EVICTION_TIMEOUT | 10 (default) or positive integer | Seconds a cached SYCL graph can go unused before it is evicted. Checked on a sweep that runs every half of this timeout. |
+| GGML_SYCL_ENABLE_HOST_PINNED_MEM | 0 or 1 (default) | Enable host pinned memory to speed up copy data from host to device. When disable it, host memory will common malloc() on CPU. Disable it when use `--load-model mlock`.|
+| GGML_SYCL_HOST_PINNED_MEM_2G | 0 (default) or 1 | Limit the max memory allocation to be no more than 2GB when enable host pinned memory. USM allocations above 2 GiB take the relaxed/large-allocation path, which serializes H2D copies with compute and prevents copy/compute overlap. It will impact the startup time. Need more test. Depend on `GGML_SYCL_ENABLE_HOST_PINNED_MEM=1`.|
+| GGML_SYCL_UPLOAD_STAGING_SLOTS | 4 (default) or non-negative integer | Number of 8 MiB pinned host slots used to stage tensor uploads (model loading), so the host copy of one slot overlaps the transfer of the previous one. Set to 0 to use the old path: a malloc'd bounce buffer and a blocking copy per tensor. |
+| GGML_SYCL_GET_MEM_API | 0 (default) or 1  | Set to get memory info (free, total) by Level Zero or SYCL API:<br>0 - Level Zero API: support more GPUs, only run on Level Zero running time. When there is an error, fallback to call SYCL API. Depend on GGML_SYCL_SUPPORT_LEVEL_ZERO_API.<br>1 - SYCL API: legacy, support more running time, it can't get the free size of some GPUs (like Arc770). In such case, return the free size as value of total size.|
+| GGML_SYCL_USE_LEVEL_ZERO_API | 1 (default) or 0 | Use Level Zero API for device memory allocation instead of SYCL. Reduces system RAM usage on Intel dGPUs by avoiding DMA-buf/TTM host memory staging. Requires GGML_SYCL_SUPPORT_LEVEL_ZERO_API=ON at build time. SYCL backend always runs on Level Zero running time even if it's set as OFF (The SYCL api will be usage for memory allocation).|
+| GGML_SYCL_ENABLE_DNN | 0 or 1 (default)| Enable running computations through oneDNN and always use oneMKL. |
+| GGML_SYCL_FA_ONEDNN | 1 (default) or 0 | Enable the oneDNN fused SDPA (flash-attention) path on supported GPUs. Set to 0 to always use the native SYCL flash-attention kernel. |
+| GGML_SYCL_FA_ONEDNN_MAX_KV | 0 (default, disabled) or positive integer | By default (0), all sequences are handled by the oneDNN fused SDPA path, regardless of KV length; a positive value caps that length, past which sequences fall back to the native kernel. If GPU driver watchdog resets (DEVICE_LOST) occur during long-context inference, set this near the context depth where they start, e.g. 24576. |
+| GGML_SYCL_FA_DPAS | 1 (default) or 0 | Enable the XMX flash-attention kernel for a q4_0 or q8_0 KV cache (`-ctk q4_0 -ctv q4_0` or `-ctk q8_0 -ctv q8_0`) on Xe2 or newer GPUs (Arc B-series, Lunar Lake, Panther Lake, Wildcat Lake). It reads the quantized cache directly for decode and batches of up to 31 tokens, head sizes 64, 96, 128, 256 and 512, up to 32 query heads per KV head. Set to 0 to use the native SYCL flash-attention kernels. |
+| GGML_SYCL_ENABLE_VMM | 0 or 1 (default) | Enable the virtual-memory device pool. |
+| GGML_SYCL_ENABLE_MKL_FA | 1 (default) or 0 | Enable oneMKL GEMM flash attention for XMX-accelerated prompt processing with quantized KV cache. Automatically activates during prefill (prompt processing) when all conditions are met: (1) flash-attn enabled (`-fa` or `--flash-attn on`), (2) KV cache quantized (`--cache-type-k q8_0 --cache-type-v q8_0` or other `*_0/*_1` types), (3) batch size ≥ 1024 (`--batch-size 1024`), (4) prompt length ≥ 1024 tokens. Set to 0 to force the TILE kernel for A/B testing. Example minimum command: `llama-cli -m model.gguf -fa -ngl 99 --cache-type-k q8_0 --cache-type-v q8_0 --batch-size 1024 -p "your prompt"` |
+| GGML_SYCL_MKL_FA_DEBUG | 0 (default) or 1 | Enable per-call diagnostic logging for MKL flash attention: GEMM/softmax timings, interleaved-head detection, and buffer memory usage. |
+| GGML_SYCL_MEMTRACE | 0 (default), 1, 2 | Enable record and output memory allocation diagnostics. Requires `-lv 4`. <br>0 -  Disable<br>1 - Basic memory info, including current and peak allocations, as well allocations from other sources, and the device free memory before each model buffer allocation, around 50 lines per model load.<br>2 - More verbose, logging around 900 specific allocations and deallocations. |
+| GGML_SYCL_MEMTRACE_STEP | 64 (default) or positive integer | With GGML_SYCL_MEMTRACE=1, the minimum growth in memory usage to trigger another log record. |
+| GGML_SYCL_MKL_FA_DIAG | 0 (default) or 1 | Enable output fingerprinting for MKL flash attention. Dumps the first 64 float output values for the first 6 FA calls with n_kv ≥ 1024, labeled with kernel type (MKL/TILE/VEC) for cross-kernel comparison. |
+| GGML_SYCL_ENABLE_FUSION | 0 or 1 (default) | Enable fused-kernel dispatch in graph compute. Unsupported types and layouts fall back to the standalone op kernels. See `ggml_sycl_can_fuse()`. |
+| GGML_SYCL_ENABLE_ESIMD | 0 or 1 (default)| Enable ESIMD kernels when available. |
+| GGML_SYCL_ENABLE_XMX_ESIMD | 0 or 1 (default) | Use the XMX (DPAS) multi-column mat-vec kernels for reordered Q2_K to Q6_K and Q8_0 weights on Xe2 GPUs. Speeds up speculative decoding and short prompt batches. |
+| GGML_SYCL_XMX_MAX_COLS | non-negative integer, 80 (default) | Most activation columns (batch size) the `GGML_SYCL_ENABLE_XMX_ESIMD` kernels take; wider batches use the other mat-mul kernels. A larger value keeps XMX for bigger batches (as repeated launches), `0` never uses it. |
+| GGML_SYCL_XMX_GLU_MAX_COLS | 0 to 16, 16 (default) | Most columns the fused gate and up XMX kernel takes; wider batches run gate and up as separate mat-vecs. 16 is the most the kernel is built for, larger values are clamped to 16 and `0` turns the fused kernel off. |
+| GGML_SYCL_XMX_GATHER_TYPES | decimal bitmask, all bits set (default) | Weight formats that may use the XMX dequant-GEMM paths, which dequantize weights straight into the XMX tiles. This speeds up prompt processing of MoE models on GPUs with XMX units (Arc A- and B-series, Arc Pro, Data Center GPU Max), for example pp512 of Qwen3-30B-A3B UD-IQ3_XXS by about 50% on an Arc Pro B60. Bits:<br>* 1: IQ4_NL, 2: IQ3_S, 4: IQ4_XS, 8: IQ3_XXS, 16: IQ2_XXS, 32: IQ2_XS, 64: IQ2_S, 128: IQ1_S, 256: IQ1_M<br>* 512: Q8_0, 1024: Q4_K, 2048: Q5_K, 4096: Q6_K, 8192: Q2_K, 16384: Q3_K (MoE `MUL_MAT_ID` only)<br>Add values to combine them, for example `3` for IQ4_NL and IQ3_S; `0` disables the paths. A set bit does not force the path: batches of more than 64 tokens per expert use the library GEMM unless the device schedule width heuristic is overridden with `GGML_SYCL_MMID_SCHED=3`. Row lengths must be a multiple of 256 (32 for IQ4_NL and Q8_0). |
+| GGML_SYCL_MMID_SCHED | decimal bitmask, 1 (default) | Build the grouped MoE routing and tile schedule on the GPU, avoiding the expert-ID host readback and CPU sort.<br>* 1: enable the device schedule.<br>* 2: override the fallback for models with few routed experts by disabling the performance heuristic that rejects batches averaging more than 64 routed rows per expert. This may reduce performance; type, shape, precision and device capability checks still apply.<br>Use `3` to enable the device schedule and override this heuristic, or `0` to use the host schedule. Bit 2 alone does not enable the device schedule. Higher bits are ignored. |
+| GGML_SYCL_XMX_GATHER_SHAPES | decimal bitmask, 255 (default) | XMX `joint_matrix` combinations the paths of `GGML_SYCL_XMX_GATHER_TYPES` may use; the operand type comes from `GGML_SYCL_DYNAMIC_PRECISION` and the best supported combination is picked automatically (logged as `fg_pick_combo`). Bits:<br>* Xe2, Xe3, Xe-HPC: 1: f16 8x16x16, 2: f16 16x16x16, 4: f16 32x64x16, 8: f16 32x64x32, 32: tf32 8x16x8, 64: bf16 8x16x16<br>* Xe-HPG (Arc A770, ARL-H): 16: f16 8x8x16, 128: bf16 8x8x16<br>Clear a bit to exclude a combination, or set a single bit to force one for testing. |
+| GGML_SYCL_DYNAMIC_PRECISION | `F16` (default with `GGML_SYCL_F16=ON`), `BF16`, `TF32` or `F32` (default otherwise) | Operand type of the XMX dequant-GEMM paths (`GGML_SYCL_XMX_GATHER_TYPES`); accumulation is always f32. `F16` is the fastest, but activations above 65504 overflow. `BF16` keeps the f32 range at a 7-bit mantissa, `TF32` keeps the range and the f16 mantissa but is about 30% slower and needs Xe2, Xe3 or Xe-HPC, and `F32` turns the XMX paths off. Ops that request a higher src1 precision ([TAG_GGML_PREC]) get it regardless of this setting. |
+| GGML_SYCL_DYNAMIC_REQUIRED_PRECISION | `F32` (default), `TF32`, `BF16` or `F16` | Lowest type the XMX paths may use for an op that requests an F32 src1, such as Mistral 4 `ffn_down_exps`. The default runs such ops on the library f32 GEMM; `TF32` or `BF16` trade mantissa for speed while keeping the f32 range. `F16` ignores the request and can overflow; it is meant for testing only. |
+| GGML_SYCL_MMVQ_WIDE | 0 or 1 (default) | Use the wide-load variant of the reordered Q8_0 mat-vec kernel, which reads four contiguous dwords per operand instead of one value at a time. Set to 0 to fall back to the per-value loads. Only affects Q8_0 weights in the reordered layout. |
+| GGML_SYCL_SPARSE_FA | 0 (default) or 1 | Enable Sparse Flash-attention.|
+| GGML_SYCL_SPARSE_FA_DEBUG | 0 (default) or 1 | Enable to debug for Sparse Flash-attention.|
+| GGML_SYCL_SPARSE_FA_MARGIN | [0,..] default:256 | Set the margin value for Sparse Flash-attention.|
+| ZES_ENABLE_SYSMAN | 0 (default) or 1 | Support to get free memory of GPU by sycl::aspect::ext_intel_free_memory.<br>Recommended to use when --split-mode = layer |
+| UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS | 0 (default) or 1 | Allow SYCL/Unified Runtime Level Zero device allocations larger than 4 GiB. llama.cpp's direct Level Zero allocation path requests the relaxed maximum-size limit itself when GGML_SYCL_ENABLE_LEVEL_ZERO=1. |
+| GGML_SYCL_USM_SYSTEM | 0 (default) or 1 | Enable experimental support for [USM system allocations](https://github.khronos.org/SYCL_Reference/iface/usm_basic_concept.html#system-allocations) for large GPU buffers. This requires enough host memory for model weights and caches, an Intel Xe2+ GPU such as BMG or newer and supported on Linux only, with CONFIG_DRM_XE_GPUSVM enabled. |
+| GGML_SYCL_BMG_VRAM_CHECK | 1 (default) or 0 | Workaround for BMG (Arc B-series) GPUs, where the Level Zero driver accepts device allocations beyond VRAM and moves the overflow to system RAM, which can exhaust host memory when a model does not fit (e.g. `-ngl 999`, see https://github.com/intel/compute-runtime/issues/1047). When enabled, a model or split buffer that does not fit in the device's free memory is refused and the model load fails with an error. Set to 0 to disable. |
+
+1. <a id="sycl-graph-footnote"></a>SYCL Graph support (`GGML_SYCL_ENABLE_GRAPH=1`) is limited to single-GPU workloads and may also depend on the model architecture and kernels in use.
+   Performance depends on how often a recorded graph can be reused, which will vary by workload.
+   For this reason, it is recommended to measure performance both with and without graphs enabled on your workloads.
+
+   To check whether graphs are supported for your workload, enable INFO logging (`-lv 4`) and look for `enabling SYCL graphs` or `disabling SYCL graphs`.
+   Support may differ between prefill and decode, so check the status for the phases that matter to you.
+   DEBUG logging (`-lv 5`) reports why graphs are disabled.
+
+   Then benchmark with your preferred tool, such as `llama-bench`.
+   For graph activity details (including reuse), set `GGML_SYCL_DEBUG=1` and look for `[SYCL-GRAPH]` messages.
+
+### Flash-attention kernels
+
+Attention dispatches on shape and hardware.
+
+DPAS is the quantized path. q4_0 or q8_0 KV cache, decode and batches up to 31 tokens, Xe2 and newer only. It issues dpas straight on the quantized blocks and never materialises an f16 copy. vISA gets used here because joint_matrix has no s4 type.
+
+oneDNN does XMX through SDPA but converts KV to f16 first, so it ends up on prefill: 32+ tokens and 1K+ keys. MKL is the prompt processing equivalent through oneMKL GEMM, also f16.
+
+VEC/TILE are plain kernels with no XMX in them. They run when DPAS is off or the hardware doesn't support it.
+
+joint_matrix belongs to the matmul GEMMs. Attention doesn't use it.
+
+## Compile-time Flags
+
+Pass these via `CXXFLAGS` or add a one-off `#define` to enable a flag on the spot.
+
+| Name            | Function                                                                         |
+|-----------------|----------------------------------------------------------------------------------|
+| DEBUG_SYCL_POOL | Enable device memory pool logging on teardown. Useful for profiling allocations. |
+| DEBUG_SYCL_MALLOC | Enable verbose per-call logging of device pool alloc/free operations. |
+| GGML_SYCL_SUPPORT_VMM | Support to building with VMM code. Default is Yes. |
+
+## Design Rule
+
+- Open to all contributors.
+
+- All code change should be useful to user:
+    - Fix bug.
+    - Add new function.
+    - Improve the performance/usage.
+    - Make code be easy to maintain.
+    - ...
+
+- Don't accept the codes of following cases:
+    - Break legacy function.
+    - Reduce the performance of legacy case in default.
+    - Not completed work/the functionality cannot be demonstrated.
+
+- Encourage to use environment variable to control features to be opened/closed.
+    - User can evaluate the feature without rebuild the code.
+    - Recommend the best features to user by setting them be opened as default.
+
+- Design the code based on the published official releases of oneAPI packages: compiler, library, driver, OS kernel.
+
+- Developers need to maintain the code they submit.
+
+## Known Issues
+
+- `Split-mode:[row]` is not supported.
+
+- Missed the AOT (Ahead-of-Time) in building.
+  - Good: Builds quickly, smaller size of binary file.
+  - Bad: The startup is slow (JIT) in first time, but subsequent performance is unaffected.
+
+## Q&A
+
+- Error:  `error while loading shared libraries: libsycl.so: cannot open shared object file: No such file or directory`.
+
+  - Potential cause: Unavailable oneAPI installation or not set ENV variables.
+  - Solution: Install *oneAPI base toolkit* and enable its ENV through: `source /opt/intel/oneapi/setvars.sh`.
+
+- General compiler error:
+
+  - Remove **build** folder or try a clean-build.
+
+- I can **not** see `[ext_oneapi_level_zero:gpu]` after installing the GPU driver on Linux.
+
+  Please double-check with `sudo sycl-ls`.
+
+  If it's present in the list, please add video/render group to your user then **logout/login** or restart your system:
+
+  ```
+  sudo usermod -aG render $USER
+  sudo usermod -aG video $USER
+  ```
+  Otherwise, please double-check the GPU driver installation steps.
+
+- Can I report Ollama issue on Intel GPU to llama.cpp SYCL backend?
+
+  No. We can't support Ollama issue directly, because we aren't familiar with Ollama.
+
+  Suggest reproducing on llama.cpp and report similar issue to llama.cpp. We will support it.
+
+  It's same for other projects including llama.cpp SYCL backend.
+
+- `Native API failed. Native API returns: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)`, `ggml_backend_sycl_buffer_type_alloc_buffer: can't allocate 3503030272 Bytes of memory on device`, or `failed to allocate SYCL0 buffer`
+
+  You are running out of Device Memory.
+
+  |Reason|Solution|
+  |-|-|
+  | The default context is too big. It leads to excessive memory usage.|Set `-c 8192` or a smaller value.|
+  | The model is too big and requires more memory than what is available.|Choose a smaller model or change to a smaller quantization, like Q5 -> Q4;<br>Alternatively, use more than one device to load model.|
+
+- `ggml_backend_sycl_buffer_type_alloc_buffer: can't allocate 5000000000 Bytes of memory on device`
+
+  With the default `GGML_SYCL_ENABLE_LEVEL_ZERO=1`, llama.cpp requests Level Zero's relaxed maximum-size allocation limit directly. If Level Zero support is disabled at build time or runtime and the allocation goes through SYCL/Unified Runtime instead, enable support for allocations larger than 4 GiB by:
+  ```
+    export UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
+    set UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
+  ```
+
+- When I set `SYCL_CACHE_PERSISTENT=1` in running time, I meet crash.
+
+  `SYCL_CACHE_PERSISTENT=1` is not recommended by llama.cpp SYCL backend.
+  When cache is enabled, SYCL runtime will try to cache and reuse JIT-compiled binaries.
+
+  We find some AI will tell user this cmd to speed up SYCL backend. It only speeds up the startup to skip the JIT process, instead of running speed.
+
+  It will bring negative impact when the SYCL binary file is changed frequently in your running environment. The new & old codes mix will lead to crash.
+
+  Compare to the benefit, it has brought more failed cases.
+  If you are not familiar with the SYCL compiler principle of JIT and AOT, please don't use it.
+
+  To restore, you need to remove the local cache: `~/.cache/libsycl_cache/` and execute `unset SYCL_CACHE_PERSISTENT` in running time.
+
+- How to use iGPU and dGPU in same time?
+
+  1. Detect the devices in your running time.
+  ```
+  source /opt/intel/oneapi/setvars.sh
+  ./build/bin/llama-server --list-devices
+
+  or
+  ./build/bin/llama-cli --list-devices
+  ./build/bin/llama-bench --list-devices
+  ./build/bin/llama-completion --list-devices
+
+  Available devices:
+    SYCL0: Intel(R) Arc(TM) A770 Graphics (15473 MiB, 15473 MiB free)
+    SYCL1: Intel(R) UHD Graphics 770 (59675 MiB, 44986 MiB free)
+  ```
+
+  The dGPU will be in the head of this list and iGPU will be the end.
+  If not all GPUs are listed, please check the env var: ONEAPI_DEVICE_SELECTOR and unset it.
+
+  2. Set the iGPU and dGPU
+
+  Set the iGPU and dGPU by `./build/bin/llama-server --device SYCL0,SYCL1,SYCLxxx`.
+
+
+### **GitHub contribution**:
+Please add the `[SYCL]` prefix/tag in issues/PRs titles to help the SYCL contributors to check/address them without delay.
+
+## TODO
+
+- Review ZES_ENABLE_SYSMAN: https://github.com/intel/compute-runtime/blob/master/programmers-guide/SYSMAN.md#support-and-limitations
+# llama.cpp
+
+![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
+
+<div align="center">
+
+<b>LLM inference in C/C++</b>
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v1)
+[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
+[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
+[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
+[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+
+[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Asanmai%20OR%20author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Athelittlefireman%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3AmasterFoad%20OR%20author%3Aallozaur%20OR%20author%3AAndreas-Krebbel%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Achaxu01%20OR%20author%3Alhez%20OR%20author%3AAlekseiNikiforovIBM%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming%20OR%20author%3Aynankani)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+
+</div>
+
+## Quick start
+
+A few options to get `llama.cpp` installed on your machine:
+
+```bash
+# curl
+curl -LsSf https://llama.app/install.sh | sh
+
+# powershell
+irm https://llama.app/install.ps1 | iex
+```
+
+- Visit https://llama.app and follow the instructions
+- Run with Docker - see our [Docker documentation](docs/docker.md)
+- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
+- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+
+Once installed:
+
+```sh
+# Download and run a model directly from Hugging Face
+llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+
+# Launch OpenAI-compatible API server
+llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```
+
+<table align="center">
+    <tr>
+        <td align="center" width=50%>
+            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
+            <i>VLM session with <b>llama cli</b></i>
+        </td>
+        <td align="center">
+            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
+            <i>Built-in web UI against <b>llama serve</b></i>
+        </td>
+    </tr>
+<table>
+
+## Description
+
+The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
+a wide range of hardware - locally and in the cloud.
+
+- Plain C/C++ implementation without any dependencies
+- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
+- AVX, AVX2, AVX512 and AMX support for x86 architectures
+- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
+- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
+- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
+- Vulkan and SYCL backend support
+- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+
+The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+
+## Supported backends
+
+| Backend | Target devices |
+| --- | --- |
+| [BLAS](docs/build.md#blas-build) | All |
+| [BLIS](docs/backend/BLIS.md) | All |
+| [CANN](docs/build.md#cann) | Huawei Ascend NPU |
+| [CUDA](docs/build.md#cuda) | Nvidia GPU |
+| [HIP](docs/build.md#hip) | AMD GPU |
+| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
+| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
+| [MUSA](docs/build.md#musa) | Moore Threads GPU |
+| [Metal](docs/build.md#metal-build) | Apple Silicon |
+| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
+| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
+| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
+| [SYCL](docs/backend/SYCL.md) | Intel GPU |
+| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
+| [Vulkan](docs/build.md#vulkan) | GPU |
+| [WebGPU](docs/build.md#webgpu) | All |
+| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+
+## Documentation
+
+#### Tools
+
+- [cli](tools/cli/README.md)
+- [completion](tools/completion/README.md)
+- [server](tools/server/README.md)
+- [GBNF grammars](grammars/README.md)
+
+#### Development
+
+- [How to build](docs/build.md)
+- [Running on Docker](docs/docker.md)
+- [Build on Android](docs/android.md)
+- [Multi-GPU usage](docs/multi-gpu.md)
+- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
+- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
+- [XCFramework](docs/xcframework.md)
+- [Completions](docs/completions.md)
+- [Models](docs/models.md)
+- [Release process](docs/release.md)
+
+## Contributing
+
+- Contributors can open PRs
+- Collaborators will be invited based on contributions
+- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
+- Any help with managing issues, PRs and projects is very appreciated!
+- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+
+## Acknowledgements
+
+- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
+- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
+- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
+- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
+- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain

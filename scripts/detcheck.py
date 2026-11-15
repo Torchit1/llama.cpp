@@ -26,7 +26,11 @@ def log(msg):
 
 
 def text_file(tmp):
-    # scoring text for the logits check: llama.cpp's own docs (MIT), so nothing third-party is shipped
+    # scoring text for the logits check: llama.cpp's own docs (MIT), so nothing third-party is shipped.
+    # Release tarballs ship it next to this script as detcheck-text.txt; a source checkout reads the docs directly.
+    bundled = os.path.join(HERE, "detcheck-text.txt")
+    if os.path.exists(bundled):
+        return bundled
     root = os.path.dirname(HERE)
     parts = []
     for rel in ("docs/build.md", "docs/backend/SYCL.md", "README.md"):
@@ -99,7 +103,10 @@ def check_build(bin_dir, model, ubs, tmp, tag, a):
 def main():
     ap = argparse.ArgumentParser(description="Does this llama.cpp build give the same answer every time?")
     ap.add_argument("-m", "--model", required=True)
-    ap.add_argument("-b", "--bin", default=os.path.join(os.path.dirname(HERE), "build", "bin"), help="build A bin dir")
+    # release tarball: scripts/ sits inside the folder with llama-server; source checkout: build/bin
+    here_bin = os.path.dirname(HERE)
+    default_bin = here_bin if os.path.exists(os.path.join(here_bin, "llama-server")) else os.path.join(here_bin, "build", "bin")
+    ap.add_argument("-b", "--bin", default=default_bin, help="build A bin dir")
     ap.add_argument("-B", "--bin2", help="optional build B bin dir: SAME/DIFFERENT against A")
     ap.add_argument("--ub", type=int, nargs="+", default=[512, 128], help="ubatch sizes for the batch-invariance check")
     ap.add_argument("--ctx", type=int, default=512)
