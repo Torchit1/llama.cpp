@@ -911,7 +911,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     // keep the cells of the live picked pools and the tail, -inf elsewhere
     // all retained cells are in the token's sequence, so the kq_mask is not needed
-    if (cparams.fused_top_k_mask) {
+    // LLAMA_QSA_MASK_OP=0 (switchable while the server runs): build the mask from separate ops even where the backend has the fused one
+    if (cparams.fused_top_k_mask && ggml_live_switch("LLAMA_QSA_MASK_OP", 1) != 0) {
         GGML_ASSERT(kpool*n_top_pool + inp_kpool->tail_idxs->ne[0] == inp_kpool->n_sel);
 
         ggml_tensor * keep = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, type_mask, inp_kpool->n_kv), 0.0f);
@@ -931,6 +932,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     GGML_ASSERT(n_sel == inp_kpool->n_sel);
 
     ggml_build_forward_expand(gf, sel_idx);
+
+    qsa_rows = nullptr;
+    // read per graph build, so it can be switched while the server runs (GGML_SWITCH_FILE)
+    const bool qsa_rows_on = ggml_live_switch("LLAMA_QSA_ROWS", 0) != 0;
+    if (qsa_rows_on && cparams.flash_attn) {
+        // row list: the attention reads the selected cells in place, dead slots become row -1 with a -inf mask entry
+        ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k); // [1, n_top_pool, n_tokens]
+        ggml_tensor * live_pool = ggml_clamp(ctx0, ggml_scale_bias(ctx0, top_score, 1.0f, 1.0f), 0.0f, 1.0f);
+        live_pool = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, live_pool, kpool, n_top_pool, n_tokens, 1), kpool*n_top_pool, n_tokens);
+        ggml_tensor * live_tail = ggml_cast(ctx0, inp_kpool->tail_idxs, GGML_TYPE_F32);
+        live_tail = ggml_clamp(ctx0, ggml_scale_bias(ctx0, live_tail, -1.0f, (float) inp_kpool->n_kv), 0.0f, 1.0f);
+        ggml_tensor * live = ggml_concat(ctx0, live_pool, live_tail, 0); // [n_sel, n_tokens]
+
+        ggml_tensor * idx_f = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
+        idx_f    = ggml_add(ctx0, ggml_mul(ctx0, idx_f, live), ggml_scale_bias(ctx0, live, 1.0f, -1.0f));
+        qsa_rows = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
+
+        ggml_tensor * sel = ggml_cast(ctx0, ggml_scale_bias(ctx0, live, 1e30f, -1e30f), type_mask); // 0 or -inf
+        cb(sel, "indexer_sel", il);
+
+        return sel;
+    }
 
     // TODO: figure out to reduce the large copmute buffer that this creates
 
@@ -1017,6 +1040,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    if (qsa_rows) {
+        // one q slice per token, each with its own rows; the mask covers the listed cells only
+        GGML_ASSERT(k->ne[3] == 1 && "LLAMA_QSA_ROWS needs a single stream");
+        ggml_tensor * rows = qsa_rows;
+        qsa_rows = nullptr;
+        sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], 1, 1, sel->ne[1]);
+        cb(sel, "kq_mask_qsa", il);
+
+        ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, rows, nullptr, nullptr, n_sel, kq_scale, il);
+        cb(cur, "kqv_out", il);
+
+        if (inp->self_v_rot[il]) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
+        }
+
+        return cur;
+    }
 
     // the selection replaces the kq_mask: split it into the streams of the K view
     const int64_t n_stream = k->ne[3];

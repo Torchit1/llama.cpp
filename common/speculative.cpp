@@ -1914,6 +1914,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         int i = 0;
 
+        // local test aids, switchable while the server runs: LLAMA_SPEC_N_MAX (never above the configured n_max, which
+        // sized the recurrent snapshots) and LLAMA_SPEC_P_MIN_PCT (percent)
+        const int   n_max_live = std::min<int>(params.n_max, ggml_live_switch("LLAMA_SPEC_N_MAX", params.n_max));
+        const int   p_min_pct  = ggml_live_switch("LLAMA_SPEC_P_MIN_PCT", -1);
+        const float p_min_live = p_min_pct >= 0 ? p_min_pct / 100.0f : params.p_min;
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < pos0
@@ -1964,7 +1969,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < p_min_live) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1983,7 +1988,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                if (n_max_live <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

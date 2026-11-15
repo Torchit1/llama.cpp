@@ -25,6 +25,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <vector>
+#include <map>
+#include <set>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -85,6 +87,7 @@
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/ssm_scan.hpp"
 #include "ggml-sycl/fill.hpp"
+#include "ggml-sycl/fattn-sparse.hpp"
 #include "ggml-sycl/cumsum.hpp"
 #include "ggml-sycl/diag.hpp"
 #include "ggml-sycl/opt-step.hpp"
@@ -1314,7 +1317,7 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
 
 static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     // Reserve the additional scratch so it's visible to the graph allocator
-    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
+    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT && tensor->src[5] == nullptr // a row list needs no scratch
         ? ggml_sycl_flash_attn_ext_get_alloc_size(tensor)
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
@@ -3533,6 +3536,112 @@ static void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     } else {
         ggml_sycl_top_k_radix(ctx, src0_dd, dst_dd, ncols, nrows, k, main_stream);
     }
+
+    // local probe, GGML_SYCL_TOPK_OVERLAP=N: how much of a token's selection (the indexer's top pools) it shares with the
+    // token before it, inside a step and across steps, for selections out of more than 1000 candidates. Reads the result
+    // back, so it slows the run; every N calls it prints the mean shared fraction.
+    static const int probe_every = getenv("GGML_SYCL_TOPK_OVERLAP") ? atoi(getenv("GGML_SYCL_TOPK_OVERLAP")) : 0;
+    if (probe_every > 0 && ncols > 1000 && nrows <= 16) {
+        static std::map<std::string, std::vector<int32_t>> last;
+        static double sum_in = 0, sum_x = 0; static int64_t n_in = 0, n_x = 0, calls = 0;
+        std::vector<int32_t> cur((size_t) nrows * k);
+        main_stream->wait();
+        main_stream->memcpy(cur.data(), dst_dd, cur.size() * sizeof(int32_t)).wait();
+        const auto shared = [&](const int32_t * a, const int32_t * b) {
+            std::set<int32_t> sa(a, a + k);
+            int n = 0;
+            for (int i = 0; i < k; i++) { n += sa.count(b[i]) ? 1 : 0; }
+            return (double) n / k;
+        };
+        for (int64_t r = 1; r < nrows; r++) { sum_in += shared(&cur[(r - 1) * k], &cur[r * k]); n_in++; }
+        auto & prev = last[dst->name];
+        if ((int64_t) prev.size() >= k) { sum_x += shared(&prev[prev.size() - k], &cur[0]); n_x++; }
+        prev = cur;
+        if (++calls % probe_every == 0) {
+            fprintf(stderr, "TOPKOVERLAP k=%d of %lld: next token in the same step shares %.1f%% (n=%lld), first token of the next step shares %.1f%% (n=%lld)\n",
+                    k, (long long) ncols, n_in ? 100 * sum_in / n_in : 0.0, (long long) n_in, n_x ? 100 * sum_x / n_x : 0.0, (long long) n_x);
+            sum_in = sum_x = 0; n_in = n_x = 0;
+        }
+    }
+}
+
+// GGML_OP_TOP_K_MASK: res[c, i] = mask[c, i % m] where c is a cell of a live pick of row i or one of its extra cells,
+// -inf everywhere else. Two launches: fill the rows, then one work-item per (row, pick or extra) writes its cells.
+static bool ggml_sycl_top_k_mask_supported(const ggml_tensor * dst) {
+    const ggml_tensor * mask = dst->src[0], * top_k = dst->src[1], * score = dst->src[2], * blocks = dst->src[3], * extra = dst->src[4];
+    return mask && top_k && (dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32) && dst->type == mask->type &&
+           dst->nb[0] == ggml_type_size(dst->type) && mask->nb[0] == dst->nb[0] && top_k->type == GGML_TYPE_I32 &&
+           (!score || score->type == GGML_TYPE_F32) && (!blocks || blocks->type == GGML_TYPE_I32) &&
+           (!extra || extra->type == GGML_TYPE_I32) && mask->ne[0] <= INT32_MAX && ggml_nrows(dst) <= INT32_MAX;
+}
+
+template <typename T>
+static void ggml_sycl_top_k_mask(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * mask = dst->src[0], * top_k = dst->src[1], * score = dst->src[2], * blocks = dst->src[3], * extra = dst->src[4];
+    const uint32_t n_kv    = (uint32_t) mask->ne[0];
+    const uint32_t ne1     = (uint32_t) dst->ne[1], ne2 = (uint32_t) dst->ne[2];
+    const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
+    const uint32_t n_top   = (uint32_t) top_k->ne[0];
+    const uint32_t n_blk   = blocks ? (uint32_t) blocks->ne[0] : 1;
+    const int32_t  n_pick  = (int32_t) (blocks ? blocks->ne[1] : score ? score->ne[0] : mask->ne[0]);
+    const uint32_t n_extra = extra ? (uint32_t) extra->ne[0] : 0;
+    const uint32_t m1 = (uint32_t) mask->ne[1], m2 = (uint32_t) mask->ne[2], m3 = (uint32_t) mask->ne[3];
+
+    char *       d_d = (char *) dst->data;
+    const char * m_d = (const char *) mask->data;
+    const char * t_d = (const char *) top_k->data;
+    const char * s_d = score ? (const char *) score->data : nullptr;
+    const char * b_d = blocks ? (const char *) blocks->data : nullptr;
+    const char * e_d = extra ? (const char *) extra->data : nullptr;
+    const size_t dnb1 = dst->nb[1], dnb2 = dst->nb[2], dnb3 = dst->nb[3];
+    const size_t mnb1 = mask->nb[1], mnb2 = mask->nb[2], mnb3 = mask->nb[3];
+    const size_t tnb0 = top_k->nb[0], tnb1 = top_k->nb[1], tnb2 = top_k->nb[2], tnb3 = top_k->nb[3];
+    const size_t snb0 = score ? score->nb[0] : 0, snb1 = score ? score->nb[1] : 0, snb2 = score ? score->nb[2] : 0, snb3 = score ? score->nb[3] : 0;
+    const size_t bnb0 = blocks ? blocks->nb[0] : 0, bnb1 = blocks ? blocks->nb[1] : 0;
+    const size_t enb0 = extra ? extra->nb[0] : 0, enb1 = extra ? extra->nb[1] : 0, enb2 = extra ? extra->nb[2] : 0, enb3 = extra ? extra->nb[3] : 0;
+
+    dpct::queue_ptr stream = ctx.stream();
+    const T ninf = (T) -INFINITY;
+    stream->parallel_for(sycl::range<2>((size_t) n_rows, (size_t) n_kv), [=](sycl::id<2> id) {
+        const uint32_t ir = (uint32_t) id[0];
+        const uint32_t i1 = ir % ne1, i2 = (ir / ne1) % ne2, i3 = ir / (ne1 * ne2);
+        ((T *) (d_d + i1 * dnb1 + i2 * dnb2 + i3 * dnb3))[id[1]] = ninf;
+    });
+    stream->parallel_for(sycl::range<2>((size_t) n_rows, (size_t) (n_top + n_extra)), [=](sycl::id<2> id) {
+        const uint32_t ir = (uint32_t) id[0], j = (uint32_t) id[1];
+        const uint32_t i1 = ir % ne1, i2 = (ir / ne1) % ne2, i3 = ir / (ne1 * ne2);
+        const T * mrow = (const T *) (m_d + (i1 % m1) * mnb1 + (i2 % m2) * mnb2 + (i3 % m3) * mnb3);
+        T *       drow = (T *) (d_d + i1 * dnb1 + i2 * dnb2 + i3 * dnb3);
+        if (j >= n_top) { // an extra cell of this row
+            const int32_t c = *(const int32_t *) (e_d + i1 * enb1 + i2 * enb2 + i3 * enb3 + (size_t) (j - n_top) * enb0);
+            if (c >= 0 && (uint32_t) c < n_kv) {
+                drow[c] = mrow[c];
+            }
+            return;
+        }
+        const int32_t p = *(const int32_t *) (t_d + i1 * tnb1 + i2 * tnb2 + i3 * tnb3 + (size_t) j * tnb0);
+        if (p < 0 || p >= n_pick) {
+            return;
+        }
+        if (s_d) {
+            const float sc = *(const float *) (s_d + (size_t) p * snb0 + i1 * snb1 + i2 * snb2 + i3 * snb3);
+            if (!(sc > -INFINITY)) {
+                return;
+            }
+        }
+        if (!b_d) {
+            if ((uint32_t) p < n_kv) {
+                drow[p] = mrow[p];
+            }
+            return;
+        }
+        for (uint32_t k = 0; k < n_blk; ++k) {
+            const int32_t c = *(const int32_t *) (b_d + (size_t) k * bnb0 + (size_t) p * bnb1);
+            if (c >= 0 && (uint32_t) c < n_kv) {
+                drow[c] = mrow[c];
+            }
+        }
+    });
 }
 
 inline void ggml_sycl_op_argmax(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -6536,6 +6645,13 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_TOP_K:
             ggml_sycl_op_top_k(ctx, dst);
             break;
+        case GGML_OP_TOP_K_MASK:
+            if (dst->type == GGML_TYPE_F16) {
+                ggml_sycl_top_k_mask<sycl::half>(ctx, dst);
+            } else {
+                ggml_sycl_top_k_mask<float>(ctx, dst);
+            }
+            break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             ggml_sycl_op_timestep_embedding(ctx, dst);
             break;
@@ -6582,7 +6698,11 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_arange(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            ggml_sycl_flash_attn_ext(ctx, dst);
+            if (dst->src[5] != nullptr) {
+                ggml_sycl_flash_attn_ext_rows(ctx, dst);
+            } else {
+                ggml_sycl_flash_attn_ext(ctx, dst);
+            }
             break;
         default:
             return false;
@@ -7426,6 +7546,9 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
                 }
                 break;
             case GGML_OP_FLASH_ATTN_EXT:
+                if (node->src[5] != nullptr) { // row list: one plain kernel
+                    break;
+                }
                 if (ggml_sycl_flash_attn_ext_needs_sync(ctx->device, node)) {
                     GGML_LOG_DEBUG("%s: disabling SYCL graphs due to host wait in %s\n", __func__,
                                    ggml_op_name(node_op));
@@ -8176,6 +8299,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_ARGSORT:
             return true;
+        case GGML_OP_TOP_K_MASK:
+            return ggml_sycl_top_k_mask_supported(op);
         case GGML_OP_TOP_K: {
             const ggml_tensor * src0 = op->src[0];
             const int k = op->ne[0];
@@ -8229,8 +8354,10 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
-            // K/V row lists (ggml_flash_attn_ext_rows) are not supported
-            return op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);
+            if (op->src[5] != nullptr) {
+                return ggml_sycl_flash_attn_ext_rows_supported(op);
+            }
+            return ggml_sycl_flash_attn_ext_supported(device, op);
         default:
             return false;
     }

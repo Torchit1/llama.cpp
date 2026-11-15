@@ -2743,6 +2743,10 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
+        // LLAMA_QSA_ROWS=1: build_qsa_sel returns a mask over the selected cells only and leaves their cache rows here,
+        // so the attention reads the selection through a row list instead of masking the whole cache
+        ggml_tensor * qsa_rows = nullptr;
+
         // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail
         ggml_tensor * build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,
