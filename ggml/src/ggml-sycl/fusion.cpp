@@ -1,5 +1,6 @@
 #include "fusion.hpp"
 
+#include <cstdlib>
 #include <mutex>
 #include <set>
 #include <string>
@@ -104,7 +105,7 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
     }
 
     {   // local bisection aid: each fusion pattern can be switched off live with NOFUSE_<OP>+<OP>...=1 (GGML_SWITCH_FILE);
-        // the patterns seen are printed once as FUSEKEY lines
+        // with GGML_SYCL_FUSEKEY_PRINT set, the patterns seen are printed once as FUSEKEY lines
         static std::mutex            key_mtx;
         static std::set<std::string> key_seen;
         std::string key = "NOFUSE_";
@@ -116,7 +117,8 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         }
         {
             std::lock_guard<std::mutex> lock(key_mtx);
-            if (key_seen.insert(key).second) {
+            static const bool print_keys = getenv("GGML_SYCL_FUSEKEY_PRINT") != nullptr;
+            if (key_seen.insert(key).second && print_keys) {
                 fprintf(stderr, "FUSEKEY %s\n", key.c_str());
             }
         }
