@@ -168,6 +168,9 @@ static bool ggml_sycl_dnnl_detect_optimized_gemm(int device) {
 
         dnnl::primitive_attr attr;
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        if (ggml_sycl_dnn_deterministic()) {
+            attr.set_deterministic(true);  // probe the same kernel choice the matmuls get
+        }
 
         const auto & q   = dpct::dev_mgr::instance().get_device(device).default_queue();
         const auto   eng = dnnl::sycl_interop::make_engine(q.get_device(), q.get_context());
@@ -551,6 +554,7 @@ static void ggml_check_sycl() try {
 
 #if defined(GGML_SYCL_DNNL)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: %d\n", g_ggml_sycl_enable_dnn);
+        GGML_LOG_INFO("  GGML_SYCL_DNN_DETERMINISTIC: %d\n", (int) ggml_sycl_dnn_deterministic());
         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN: %d\n", g_ggml_sycl_fa_onednn);
 #else
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: DNN disabled by compile flag\n");

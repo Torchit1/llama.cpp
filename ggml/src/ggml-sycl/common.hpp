@@ -72,6 +72,16 @@ extern int g_ggml_sycl_enable_optimize;
 extern int g_ggml_sycl_enable_fusion;
 extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_mmvq_wide;
+
+int ggml_sycl_get_env(const char *env_name, int default_val);
+
+// oneDNN matmuls with deterministic=true, so the same request on the same build gives the same output.
+// The library default (false) lets oneDNN pick reductions whose order changes run to run on some devices (seen on
+// the Arc Pro B70). GGML_SYCL_DNN_DETERMINISTIC=0 restores the library default.
+inline bool ggml_sycl_dnn_deterministic() {
+    static const bool v = ggml_sycl_get_env("GGML_SYCL_DNN_DETERMINISTIC", 1) != 0;
+    return v;
+}
 extern int g_ggml_sycl_enable_xmx_esimd;
 extern int g_ggml_sycl_xmx_max_cols;
 extern int g_ggml_sycl_xmx_glu_max_cols;

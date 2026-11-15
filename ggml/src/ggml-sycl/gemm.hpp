@@ -56,6 +56,9 @@ public:
         const auto c_md    = dnnl::memory::desc(c_dims, ct, c_strides);
         dnnl::primitive_attr primitive_attr;
         primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        if (ggml_sycl_dnn_deterministic()) {
+            primitive_attr.set_deterministic(true);
+        }
 
 #ifdef GGML_SYCL_F16
         primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
