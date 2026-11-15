@@ -16,18 +16,21 @@ Hardware: Arc Pro B70 (32 GB) and Arc B580 (12 GB) in one machine, Linux, oneAPI
 |---|---|---|---|
 | Qwen3.8 Flash-Next Coder IQ1_M + draft head | B70, all in VRAM | 99.8-101.5 | 90.8-94.7 (82.4-83.1 at 16K) |
 | Qwen3.5-35B-A3B Q4_K_M (22 GB) | B70, all in VRAM | 107-119 | |
-| Qwen3.5-35B-A3B Q4_K_M (22 GB) | B580, tiers, 12 GB RAM budget | 17.0 / 27.4 | 25.2 |
+| Qwen3.5-35B-A3B Q4_K_M (22 GB) | B580, tiers, 12 GB RAM budget | 18.4 / 33.3 | 31.7 |
 | same, mainline options: expert cache only | B580 | 15.7 | 18.7 |
 | same, mainline options: experts on the CPU | B580 | 5.2-5.9 | did not finish in 15 min |
 | Qwen3.5-122B-A10B UD-IQ3_XXS (44.7 GB) | B70, tiers, 13 GB RAM budget | 13.4 / 27.1 | 25.4 |
 | same, mainline options: expert cache only | B70 | 11.0 / 16.2 | 12.5 |
 | same, mainline options: experts on the CPU | B70 | 0.9-1.1 | |
-| Qwen3.5-122B-A10B UD-IQ3_XXS (44.7 GB) | B70 + B580, tiers, 13 GB RAM budget | 15.3 / 38.4 | 30.3 |
+| Qwen3.5-122B-A10B UD-IQ3_XXS (44.7 GB) | B70 + B580, tiers, 13 GB RAM budget | 17.6 / 35.0 | 33.1 |
+| same, 8 GB RAM budget | B70 + B580, tiers | 15.7 / 38.5 | 32.5 |
 
 - The tier runs give the same output as the same model with everything on a card.
 - A model that fits one card is 17-25% slower when split over two. The launcher uses one card when the model fits.
-- Measured after the table: small host-to-card copies through pinned memory (`GGML_SYCL_PIN_SMALL`, on by default) took
-  the 122B on the B70 from 37.6 to 40.7 t/s and the 35B on a 12 GB VRAM budget from 13.7 to 17.6 t/s on a repeated prompt.
+- The B580 and two-card rows were measured on the pushed build. The B70 rows for the 35B and 122B are from before
+  small host-to-card copies went through pinned memory (`GGML_SYCL_PIN_SMALL`, on by default); that change took the 122B
+  on the B70 from 37.6 to 40.7 t/s on a repeated prompt, switch off and on inside one server.
+- The mainline-options rows were measured before that change too.
 - Expert weight formats with a kernel on the card: Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, IQ1_S,
   IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS. Only IQ1_M, Q4_K_M and IQ3_XXS models were run end to end.
 - Repeatability: with a fresh server per run, the same request gave identical output in every repeat tried (Flash-Next,
@@ -59,8 +62,8 @@ at a time, and the `Level Zero v2` adapter.
   the free RAM minus 5 GB.
 - `--head HEAD.gguf`: a multi-token draft head for the model, if one exists.
 - `--remember`: on shutdown the server writes which experts were in VRAM and RAM, and loads them back at the next
-  start. Off by default. Output is unchanged; the first answer after a start comes sooner (122B: 2.4 s instead of
-  14.7 s to the first token) and the start takes longer (39 s instead of 29 s). Do not use it for speed measurements.
+  start. Off by default. Output is unchanged. 122B on both cards: the first answer after a start runs at 37.6 t/s
+  instead of 7.4, and the start takes 34 s instead of 15 s. Do not use it for speed measurements.
 - Order of decisions: fits the first card, use it alone; fits across the cards, split it; otherwise tiers. A model
   that is mostly dense and does not fit is refused.
 
