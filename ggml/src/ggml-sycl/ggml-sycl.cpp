@@ -173,6 +173,10 @@ static bool ggml_sycl_dnnl_detect_optimized_gemm(int device) {
 
         dnnl::primitive_attr attr;
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        // the same attribute as the matmuls that run (gemm.hpp), so the probe sees the implementation they get
+        if (std::getenv("GGML_SYCL_DNN_DETERMINISTIC") == nullptr || std::atoi(std::getenv("GGML_SYCL_DNN_DETERMINISTIC")) != 0) {
+            attr.set_deterministic(true);
+        }
 
         const auto & q   = dpct::dev_mgr::instance().get_device(device).default_queue();
         const auto   eng = dnnl::sycl_interop::make_engine(q.get_device(), q.get_context());

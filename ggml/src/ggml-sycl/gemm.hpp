@@ -13,6 +13,7 @@
 #ifndef GGML_SYCL_GEMM_HPP
 #define GGML_SYCL_GEMM_HPP
 
+#include <cstdlib>
 #include "ggml-sycl.h"
 
 #if GGML_SYCL_DNNL
@@ -56,6 +57,14 @@ public:
         const auto c_md    = dnnl::memory::desc(c_dims, ct, c_strides);
         dnnl::primitive_attr primitive_attr;
         primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        // GGML_SYCL_DNN_DETERMINISTIC=1 (default): ask oneDNN for run-to-run reproducible matmuls. On the Arc Pro B70 its
+        // GPU matmul picks kernels with atomic reductions for some shapes, and temperature-0 output then differs between
+        // fresh servers. =0 restores the library default.
+        static const bool dnn_det = std::getenv("GGML_SYCL_DNN_DETERMINISTIC") == nullptr ||
+                                    std::atoi(std::getenv("GGML_SYCL_DNN_DETERMINISTIC")) != 0;
+        if (dnn_det) {
+            primitive_attr.set_deterministic(true);
+        }
 
 #ifdef GGML_SYCL_F16
         primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
