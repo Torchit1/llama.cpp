@@ -91,6 +91,13 @@ struct task_params {
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
+    // local: drafting settings for this request only, -1 keeps the server's (see common_speculative_overrides)
+    int32_t spec_draft_n_max   = -1;
+    int32_t spec_use_draft_mtp = -1;
+    int32_t spec_use_ngram_mod = -1;
+    int32_t spec_ngram_n_min   = -1;
+    int32_t spec_ngram_n_max   = -1;
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 

@@ -1694,7 +1694,8 @@ private:
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
         srv_scope_event({{"k", "m"}, {"model", params_base.model.path}, {"draft", params_base.speculative.draft.mparams.path},
-                         {"devices", getenv("ONEAPI_DEVICE_SELECTOR") ? getenv("ONEAPI_DEVICE_SELECTOR") : ""}, {"n_ctx", params_base.n_ctx}});
+                         {"devices", getenv("ONEAPI_DEVICE_SELECTOR") ? getenv("ONEAPI_DEVICE_SELECTOR") : ""}, {"n_ctx", params_base.n_ctx},
+                         {"spec_types", common_speculative_type_name_str(params_base.speculative.types)}});
 
         // propagate new defaults back to caller
         params = params_base;
@@ -2202,7 +2203,19 @@ private:
         n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
-        srv_scope_event({{"k", "r"}, {"task", slot.task->id}, {"n_prompt", slot.task->n_tokens()}});
+        {   // drafting settings of this request (single slot: they are process-wide)
+            const auto & tp = slot.task->params;
+            common_speculative_overrides ov;
+            ov.draft_n_max   = tp.spec_draft_n_max;
+            ov.use_draft_mtp = tp.spec_use_draft_mtp;
+            ov.use_ngram_mod = tp.spec_use_ngram_mod;
+            ov.ngram_n_min   = tp.spec_ngram_n_min;
+            ov.ngram_n_max   = tp.spec_ngram_n_max;
+            common_speculative_set_overrides(ov);
+            srv_scope_event({{"k", "r"}, {"task", slot.task->id}, {"n_prompt", slot.task->n_tokens()},
+                             {"spec", {{"draft_n_max", ov.draft_n_max}, {"use_draft_mtp", ov.use_draft_mtp}, {"use_ngram_mod", ov.use_ngram_mod},
+                                       {"ngram_n_min", ov.ngram_n_min}, {"ngram_n_max", ov.ngram_n_max}}}});
+        }
         return true;
     }
 

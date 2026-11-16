@@ -22,6 +22,9 @@
 #include <random>
 #include <cinttypes>
 
+// local: drafting settings of the current request, see common_speculative_overrides
+static common_speculative_overrides g_spec_overrides;
+
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1916,7 +1919,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // local test aids, switchable while the server runs: LLAMA_SPEC_N_MAX (never above the configured n_max, which
         // sized the recurrent snapshots) and LLAMA_SPEC_P_MIN_PCT (percent)
-        const int   n_max_live = std::min<int>(params.n_max, ggml_live_switch("LLAMA_SPEC_N_MAX", params.n_max));
+        const int   n_max_live = std::min<int>(params.n_max, g_spec_overrides.draft_n_max > 0 ? g_spec_overrides.draft_n_max :
+                                               ggml_live_switch("LLAMA_SPEC_N_MAX", params.n_max));
         const int   p_min_pct  = ggml_live_switch("LLAMA_SPEC_P_MIN_PCT", -1);
         const float p_min_live = p_min_pct >= 0 ? p_min_pct / 100.0f : params.p_min;
         while (n_drafting > 0) {
@@ -2286,16 +2290,19 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             sinfo.i_last = cur_len - n;
         }
 
-        result.resize(n + params.n_max);
+        // the request may ask for shorter drafts than the server was started with
+        const int n_max_req = g_spec_overrides.ngram_n_max > 0 ? std::min<int>(params.n_max, g_spec_overrides.ngram_n_max) : params.n_max;
+        const int n_min_req = std::min<int>(n_max_req, g_spec_overrides.ngram_n_min > 0 ? g_spec_overrides.ngram_n_min : params.n_min);
+        result.resize(n + n_max_req);   // sized to the draft actually asked for: a longer buffer would leave junk after it
         for (size_t i = 0; i < n - 1; ++i) {
             result[i] = prompt.at(cur_len - n + 1 + i);
         }
         result[n - 1] = dparams.id_last;
 
-        for (int i = 0; i < params.n_max; ++i) {
+        for (int i = 0; i < n_max_req; ++i) {
             const llama_token token = mod.get(result.data() + i);
             if (token == common_ngram_mod::EMPTY) {
-                if (i < params.n_min) {
+                if (i < n_min_req) {
                     result.clear();
                     return;
                 }
@@ -3129,6 +3136,10 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     return result;
 }
 
+void common_speculative_set_overrides(const common_speculative_overrides & ov) {
+    g_spec_overrides = ov;
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -3153,6 +3164,10 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        if ((impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD && g_spec_overrides.use_ngram_mod == 0) ||
+            (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP && g_spec_overrides.use_draft_mtp == 0)) {
+            continue; // switched off for this request
+        }
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);

@@ -92,6 +92,18 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
+// local: drafting settings one request may override, so a comparison does not need a server restart. -1 keeps the
+// configured value. Lengths can only go down from what the server was started with (that sized its buffers).
+// One set for the whole process: meant for a single slot.
+struct common_speculative_overrides {
+    int32_t draft_n_max   = -1; // draft head: tokens guessed per step
+    int32_t use_draft_mtp = -1; // 0 switches the draft head's guesses off
+    int32_t use_ngram_mod = -1; // 0 switches copy-drafting (ngram-mod) off
+    int32_t ngram_n_min   = -1; // copy-drafting: shortest draft
+    int32_t ngram_n_max   = -1; // copy-drafting: longest draft
+};
+void common_speculative_set_overrides(const common_speculative_overrides & ov);
+
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 

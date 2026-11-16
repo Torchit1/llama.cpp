@@ -21,6 +21,7 @@ SERVER_RAM_MIB = 3500                         # host memory the server uses beyo
 # context: 32 MiB of VRAM per 1,024 tokens, working memory that grows with it included (Flash-Next at 262K, 16 Nov 2026)
 RESERVE_MIB = 600                             # per card, left free
 TWO_CARD_MARGIN_MIB = 4000                    # extra room when the cache is split over cards (one run so far, at 32000)
+WIDE_PASS_MIB = 700                           # working memory of a wide (up to 128-token) checking pass
 MiB = 2 ** 20
 
 def gguf_tensors(path):
@@ -81,7 +82,8 @@ def plan(a):
         ', %.0f MiB on-disk table' % m['lazy'] if m['lazy'] else '', '; draft head %.0f MiB' % head_w if h else ''))
     L('cards: %s; RAM free now %d MiB, budget %d MiB' % (', '.join('%s %d MiB' % cv for cv in zip(cards, vram)), free, ram_budget))
     if h: out['args'] += ['-md', a.head, '--spec-type', 'draft-mtp', '-ngld', '99', '-bs', '--spec-draft-n-max', '5']
-    def fixed(ub): return m['other'] + 524 + a.ctx * 32 / 1024 + (195 + 0.303 * ub) + ((head_w + 0.62 * ub + a.ctx * 4 / 1024) if h else 0)
+    if a.copy_drafts: out['args'] += ['--spec-type', 'ngram-mod', '--spec-ngram-mod-n-min', '16', '--spec-ngram-mod-n-max', '128']
+    def fixed(ub): return m['other'] + 524 + a.ctx * 32 / 1024 + (195 + 0.303 * ub) + ((head_w + 0.62 * ub + a.ctx * 4 / 1024) if h else 0) + (WIDE_PASS_MIB if a.copy_drafts else 0)
     whole = m['exps'] + fixed(512)
     # 1. one card
     if whole + RESERVE_MIB <= vram[0]:
@@ -152,6 +154,8 @@ ap.add_argument('--bin', default=os.path.dirname(shutil.which('llama-server') or
 ap.add_argument('--threads', type=int, default=12)
 # usage memory, tiers only, off by default: the experts in VRAM and RAM at shutdown are loaded back at the next start
 ap.add_argument('--remember', action='store_true'); ap.add_argument('--usage-file')
+# copy-drafting for edits: long drafts copied from text already in the conversation, checked in wide passes
+ap.add_argument('--copy-drafts', action='store_true')
 # everything after a bare -- goes to llama-server unchanged
 argv = sys.argv[1:]
 extra = []
