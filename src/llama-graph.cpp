@@ -1428,6 +1428,8 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_moe_ids.clear();
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -2382,6 +2384,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
     } else {
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    }
+
+    {   // local: LLAMA_SCOPE_EXPERTS=1 (with LLAMA_SCOPE_FILE) keeps the selection of each layer so the scope timeline can
+        // report which experts fired; it costs one small read per layer after every pass
+        static const bool keep = getenv("LLAMA_SCOPE_EXPERTS") != nullptr && getenv("LLAMA_SCOPE_FILE") != nullptr;
+        if (keep && selected_experts->type == GGML_TYPE_I32) {
+            ggml_set_output(selected_experts);
+            res->t_moe_ids.push_back({ (int32_t) il, selected_experts });
+        }
     }
 
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]

@@ -979,6 +979,9 @@ public:
 
     std::vector<ggml_tensor *> t_layer_inp;
 
+    // local: the experts each layer selected, kept readable after the pass for the scope timeline (LLAMA_SCOPE_EXPERTS)
+    std::vector<std::pair<int32_t, ggml_tensor *>> t_moe_ids;
+
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;

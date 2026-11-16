@@ -1915,6 +1915,47 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 (long long) ggml_time_us(), (unsigned long long) m[0], (unsigned long long) m[1], (unsigned long long) m[2],
                 (unsigned long long) m[3], (unsigned long long) m[4], (unsigned long long) m[5]);
         fflush(scope);
+        if (!res->t_moe_ids.empty()) {   // which experts fired: one bitmap of n_expert bits per layer, as hex
+            const int n_expert = (int) model.hparams.n_expert;
+            char ctx_id[32];
+            snprintf(ctx_id, sizeof(ctx_id), "%p", (const void *) this);
+            std::string line = std::string("{\"k\":\"x\",\"c\":\"") + ctx_id + "\",\"t\":" + std::to_string((long long) ggml_time_us()) +
+                               ",\"n_expert\":" + std::to_string(n_expert) + ",\"l\":[";
+            std::vector<int32_t> ids;
+            std::vector<uint8_t> bits((n_expert + 7)/8);
+            bool first = true;
+            for (const auto & [il_x, t_x] : res->t_moe_ids) {
+                if (t_x->buffer == nullptr) {
+                    continue;
+                }
+                // [n_expert_used, n_tokens], often a view of the full ranking: one read covering all rows, then the first
+                // n_expert_used entries of each row
+                const size_t n_used = t_x->ne[0], n_tok = t_x->ne[1], stride = t_x->nb[1]/sizeof(int32_t);
+                ids.resize((n_tok - 1)*stride + n_used);
+                ggml_backend_tensor_get(t_x, ids.data(), 0, ids.size()*sizeof(int32_t));
+                std::fill(bits.begin(), bits.end(), 0);
+                for (size_t j = 0; j < n_tok; j++) {
+                    for (size_t k = 0; k < n_used; k++) {
+                        const int32_t e = ids[j*stride + k];
+                        if (e >= 0 && e < n_expert) {
+                            bits[e >> 3] |= (uint8_t) (1u << (e & 7));
+                        }
+                    }
+                }
+                static const char * hex = "0123456789abcdef";
+                line += first ? "[" : ",[";
+                line += std::to_string(il_x) + ",\"";
+                for (uint8_t b : bits) {
+                    line += hex[b >> 4];
+                    line += hex[b & 15];
+                }
+                line += "\"]";
+                first = false;
+            }
+            line += "]}\n";
+            fputs(line.c_str(), scope);
+            fflush(scope);
+        }
     }
     if (dtrace) {
         const long long dt3 = ggml_time_us();
