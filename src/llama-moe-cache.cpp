@@ -1344,11 +1344,26 @@ struct llama_moe_cache::impl {
 
     // load the remembered experts of the layers cached on device id, at its first slot lookup
     void warm(ggml_backend_t backend, int32_t id) {
-        if (usage_path() == nullptr) {
+        // LLAMA_MOE_PRELOAD=1: with no list from a last run, fill the device cache and the RAM tier from the file at
+        // the first lookup anyway, the same share of every layer. Which experts sit on the device is then arbitrary
+        // until use sorts it out, but nothing has to come from the file one miss at a time.
+        static const bool preload_all = getenv("LLAMA_MOE_PRELOAD") != nullptr && atoi(getenv("LLAMA_MOE_PRELOAD")) != 0;
+        if (usage_path() == nullptr && !preload_all) {
             return;
         }
         if (!usage_read) {
             usage_load();
+            if (usage.empty() && preload_all) {
+                usage.resize(layers.size());
+                for (size_t il = 0; il < layers.size(); ++il) {
+                    if (!layers[il].experts.empty()) {
+                        const int32_t n = (int32_t) layers[il].experts[0]->ne[2];
+                        for (int32_t e = 0; e < n; ++e) {
+                            usage[il].vram.push_back(e);
+                        }
+                    }
+                }
+            }
             usage_warmed.assign(devices.size(), 0);
         }
         if (usage.empty() || usage_warmed[id]) {
@@ -1425,7 +1440,7 @@ struct llama_moe_cache::impl {
             }
         }
         // a warning so that it shows at the server's default verbosity: a run with a preloaded cache must be recognisable
-        LLAMA_LOG_WARN("llama_moe_cache: usage memory: device %d preloaded %zu device and %zu RAM experts from last run's list, %.2f MiB read, %.1f s\n",
+        LLAMA_LOG_WARN("llama_moe_cache: usage memory: device %d preloaded %zu device and %zu RAM experts, %.2f MiB read, %.1f s\n",
             id, n_v, n_r, (stage_bytes - bytes0)/1024.0/1024.0, (ggml_time_us() - t_start)/1e6);
     }
 

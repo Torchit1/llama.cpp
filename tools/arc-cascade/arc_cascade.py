@@ -82,11 +82,19 @@ def plan(a):
         ', %.0f MiB on-disk table' % m['lazy'] if m['lazy'] else '', '; draft head %.0f MiB' % head_w if h else ''))
     L('cards: %s; RAM free now %d MiB, budget %d MiB' % (', '.join('%s %d MiB' % cv for cv in zip(cards, vram)), free, ram_budget))
     if h: out['args'] += ['-md', a.head, '--spec-type', 'draft-mtp', '-ngld', '99', '-bs', '--spec-draft-n-max', '5']
-    def fixed_base(ub): return m['other'] + 524 + a.ctx * 32 / 1024 + (195 + 0.303 * ub) + ((head_w + 0.62 * ub + a.ctx * 4 / 1024) if h else 0)
+    # Measured on a B70 with the Flash-Next Coder and its head (16 Nov): the card's used memory grows by 33.0 MiB per 1,024
+    # tokens of context with the 16-bit attention cache and by 22.6 with the 8-bit one, from 30,430 MiB at none.
+    # Tier loads need more than that (16 Nov: plans sized from the one-card figures failed to create the head's
+    # context), so the tier sums keep the figures that the 262K tier loads were fitted to.
+    ctx_mib = (21.6 if a.cache_bits == 8 else 32.0) + (4.0 if h else 0)
+    if a.cache_bits == 8: out['args'] += ['-ctk', 'q8_0', '-ctv', 'q8_0']
+    def fixed_base(ub): return m['other'] + 524 + a.ctx * ctx_mib / 1024 + (195 + 0.303 * ub) + ((head_w + 0.62 * ub) if h else 0)
+    # what the one-card figures overstate when everything is on the card: 400 MiB and 3 MiB per 1,024 tokens with a head
+    one_card_less = 400 + (a.ctx * 3.0 / 1024 if h else 0)
     # copy-drafting is on whenever the model and its wide checking passes fit one card; --copy-drafts / --no-copy-drafts decide otherwise
     copy = a.copy_drafts
     if copy is None:
-        copy = m['exps'] + fixed_base(512) + WIDE_PASS_MIB + RESERVE_MIB <= vram[0]
+        copy = m['exps'] + fixed_base(512) - one_card_less + WIDE_PASS_MIB + RESERVE_MIB <= vram[0]
         L('copy-drafting: %s' % ('on (fits this card with its %d MiB of working memory)' % WIDE_PASS_MIB if copy else
                                  'off (its %d MiB of working memory does not fit next to everything else; --copy-drafts forces it)' % WIDE_PASS_MIB))
     if copy:
@@ -96,7 +104,7 @@ def plan(a):
     def fixed(ub): return fixed_base(ub) + (WIDE_PASS_MIB if copy else 0)
     whole = m['exps'] + fixed(512)
     # 1. one card
-    if whole + RESERVE_MIB <= vram[0]:
+    if whole - one_card_less + RESERVE_MIB <= vram[0]:
         L('plan: everything on the %s (%.0f of %d MiB)' % (cards[0], whole, vram[0]))
         out['args'] += ['-ngl', '99', '-lm', 'dio']
         return out
@@ -116,7 +124,7 @@ def plan(a):
     total = sum(vram[:len(use)])
     margin = RESERVE_MIB * len(use) + (TWO_CARD_MARGIN_MIB if len(use) > 1 else 0)
     choice = None
-    for ub in (1024, 512, 256):   # 1024 is the prompt batch the tier runs were measured with
+    for ub in ((a.prompt_batch,) if a.prompt_batch else (1024, 512, 256)):   # 1024 is the prompt batch the tier runs were measured with
         cache = total - fixed(ub) - margin
         if cache >= 3000:
             choice = (ub, cache); break
@@ -129,7 +137,7 @@ def plan(a):
     off_card = m['exps'] - cache
     ram_tier = int(max(0, min(ram_budget - SERVER_RAM_MIB, off_card)) // 100 * 100)
     disk = max(0, off_card - ram_tier)
-    if off_card > 0 and ram_tier < 2000:
+    if off_card > 0 and ram_tier < min(2000, off_card):
         out['ok'] = False
         L('REFUSED: %.0f MiB of experts do not fit in VRAM and the RAM budget of %d MiB leaves a pinned tier of %d MiB (the server '
           'itself needs about %d). Free some RAM, raise --ram-mib, or add a card.' % (off_card, ram_budget, ram_tier, SERVER_RAM_MIB))
@@ -141,6 +149,9 @@ def plan(a):
     L('  prompt batch %d tokens' % ub)
     out['cards'] = use
     out['env'].update({'LLAMA_MOE_HOST_PIN_MIB': '0', 'LLAMA_MOE_RAM_CACHE_MIB': str(ram_tier)})
+    if a.preload:
+        out['env']['LLAMA_MOE_PRELOAD'] = '1'
+        L('  start: the expert cache and the RAM tier are filled from the file before the first request (--no-preload fills them as experts are used)')
     out['args'] += ['-ngl', '99', '-lm', 'none', '-lzm', 'on', '-cmoe', '--moe-cache-mib', str(cache), '-b', str(ub), '-ub', str(ub)]
     return out
 
@@ -166,6 +177,12 @@ ap.add_argument('--threads', type=int, default=12)
 ap.add_argument('--remember', action='store_true'); ap.add_argument('--usage-file')
 # copy-drafting for edits: long drafts copied from text already in the conversation, checked in wide passes
 ap.add_argument('--copy-drafts', action=argparse.BooleanOptionalAction, default=None)
+# attention cache precision: 8 keeps about 30% more context per MiB, the answers differ slightly from 16
+ap.add_argument('--cache-bits', type=int, choices=[8, 16], default=16)
+# tiers only: prompt batch (default: the largest of 1024 / 512 / 256 that leaves room for an expert cache)
+ap.add_argument('--prompt-batch', type=int)
+# tiers only: fill the expert cache and the RAM tier at start, so no expert is read from the file mid-answer
+ap.add_argument('--preload', action=argparse.BooleanOptionalAction, default=True)
 # everything after a bare -- goes to llama-server unchanged
 argv = sys.argv[1:]
 extra = []
@@ -192,4 +209,5 @@ if a.mode == 'run':
     env['ONEAPI_DEVICE_SELECTOR'] = card_selector(p['cards'])
     exe = os.path.join(a.bin, 'llama-server')
     lib = a.bin + ((':' + os.environ['LD_LIBRARY_PATH']) if os.environ.get('LD_LIBRARY_PATH') else '')
+    sys.stdout.flush()
     os.execve(exe, [exe] + args, dict(os.environ, LD_LIBRARY_PATH=lib, **env))
