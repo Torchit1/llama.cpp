@@ -189,6 +189,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_num("spec_ngram_n_min", params.spec_ngram_n_min))->set_desc("Copy-drafting: shortest draft, for this request"));
     add((new field_num("spec_ngram_n_max", params.spec_ngram_n_max))->set_desc("Copy-drafting: longest draft, for this request"));
     add((new field_num("spec_ngram_reset", params.spec_ngram_reset))->set_desc("1 makes copy-drafting forget earlier requests before this one"));
+    add((new field_num("spec_ngram_auto", params.spec_ngram_auto))->set_desc("1 lets copy-drafting pick its draft length from how well its drafts are accepted"));
 
     add((new field_num("min_keep", params.sampling.min_keep))
         ->set_hard_limits(0, INT32_MAX)

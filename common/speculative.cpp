@@ -2209,7 +2209,19 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
+
+        // automatic draft length: doubles after a draft that is accepted whole, halves after one that mostly fails
+        int n_auto = n_auto_first;
     };
+
+    // The first drafts of a request are short: a wide checking pass that is thrown away costs several times a
+    // short one, and a copy that keeps holding reaches the configured length in a few steps.
+    static constexpr int n_auto_first = 16;
+    static constexpr int n_auto_min   = 8;
+
+    static bool auto_length() {
+        return (g_spec_overrides.ngram_auto >= 0 ? g_spec_overrides.ngram_auto : ggml_live_switch("LLAMA_SPEC_NGRAM_AUTO", 0)) != 0;
+    }
 
     std::vector<seq_info> sinfos;
 
@@ -2241,6 +2253,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        sinfo.n_auto = n_auto_first;
 
         if (g_spec_overrides.ngram_reset == 1) {
             mod.reset(); // this request must not copy from the answers of earlier ones
@@ -2295,8 +2308,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
 
         // the request may ask for shorter drafts than the server was started with
-        const int n_max_req = g_spec_overrides.ngram_n_max > 0 ? std::min<int>(params.n_max, g_spec_overrides.ngram_n_max) : params.n_max;
-        const int n_min_req = std::min<int>(n_max_req, g_spec_overrides.ngram_n_min > 0 ? g_spec_overrides.ngram_n_min : params.n_min);
+        int n_max_req = g_spec_overrides.ngram_n_max > 0 ? std::min<int>(params.n_max, g_spec_overrides.ngram_n_max) : params.n_max;
+        int n_min_req = std::min<int>(n_max_req, g_spec_overrides.ngram_n_min > 0 ? g_spec_overrides.ngram_n_min : params.n_min);
+        if (auto_length()) {
+            n_max_req = std::min(n_max_req, std::max<int>(n_auto_min, sinfo.n_auto));
+            n_min_req = std::min(n_min_req, (int) n_auto_min);
+        }
         result.resize(n + n_max_req);   // sized to the draft actually asked for: a longer buffer would leave junk after it
         for (size_t i = 0; i < n - 1; ++i) {
             result[i] = prompt.at(cur_len - n + 1 + i);
@@ -2355,6 +2372,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
+            if (n_accepted >= sinfo.n_draft_last) {
+                sinfo.n_auto = std::min<int>(params.n_max, sinfo.n_auto * 2);
+            } else if (f_acc < 0.5) {
+                sinfo.n_auto = std::max<int>(n_auto_min, sinfo.n_auto / 2);
+            }
             if (f_acc < 0.25) {
                 sinfo.n_low++;
                 if (sinfo.n_low >= 5) {

@@ -98,6 +98,7 @@ struct task_params {
     int32_t spec_ngram_n_min   = -1;
     int32_t spec_ngram_n_max   = -1;
     int32_t spec_ngram_reset   = -1;
+    int32_t spec_ngram_auto    = -1;
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit

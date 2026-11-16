@@ -102,6 +102,7 @@ struct common_speculative_overrides {
     int32_t ngram_n_min   = -1; // copy-drafting: shortest draft
     int32_t ngram_n_max   = -1; // copy-drafting: longest draft
     int32_t ngram_reset   = -1; // 1 forgets what copy-drafting learned from earlier requests before this one starts
+    int32_t ngram_auto    = -1; // 1 lets copy-drafting pick its draft length (0 off, -1 = LLAMA_SPEC_NGRAM_AUTO)
 };
 void common_speculative_set_overrides(const common_speculative_overrides & ov);
 

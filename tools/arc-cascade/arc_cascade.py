@@ -82,7 +82,10 @@ def plan(a):
         ', %.0f MiB on-disk table' % m['lazy'] if m['lazy'] else '', '; draft head %.0f MiB' % head_w if h else ''))
     L('cards: %s; RAM free now %d MiB, budget %d MiB' % (', '.join('%s %d MiB' % cv for cv in zip(cards, vram)), free, ram_budget))
     if h: out['args'] += ['-md', a.head, '--spec-type', 'draft-mtp', '-ngld', '99', '-bs', '--spec-draft-n-max', '5']
-    if a.copy_drafts: out['args'] += ['--spec-type', 'ngram-mod', '--spec-ngram-mod-n-min', '16', '--spec-ngram-mod-n-max', '128']
+    if a.copy_drafts:
+        # copy-drafting picks its own length, from 8 up to 128 tokens (LLAMA_SPEC_NGRAM_AUTO)
+        out['args'] += ['--spec-type', 'ngram-mod', '--spec-ngram-mod-n-min', '16', '--spec-ngram-mod-n-max', '128']
+        out['env']['LLAMA_SPEC_NGRAM_AUTO'] = '1'
     def fixed(ub): return m['other'] + 524 + a.ctx * 32 / 1024 + (195 + 0.303 * ub) + ((head_w + 0.62 * ub + a.ctx * 4 / 1024) if h else 0) + (WIDE_PASS_MIB if a.copy_drafts else 0)
     whole = m['exps'] + fixed(512)
     # 1. one card
@@ -130,7 +133,7 @@ def plan(a):
     L('  disk : %.0f MiB of experts read from the file when needed' % disk)
     L('  prompt batch %d tokens' % ub)
     out['cards'] = use
-    out['env'] = {'LLAMA_MOE_HOST_PIN_MIB': '0', 'LLAMA_MOE_RAM_CACHE_MIB': str(ram_tier)}
+    out['env'].update({'LLAMA_MOE_HOST_PIN_MIB': '0', 'LLAMA_MOE_RAM_CACHE_MIB': str(ram_tier)})
     out['args'] += ['-ngl', '99', '-lm', 'none', '-lzm', 'on', '-cmoe', '--moe-cache-mib', str(cache), '-b', str(ub), '-ub', str(ub)]
     return out
 
