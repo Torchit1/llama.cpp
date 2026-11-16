@@ -1046,6 +1046,16 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         }
     }
 
+    // a leaf that no node reads (an input the caller fills anyway) is not covered by the loop above
+    for (int i = 0; i < graph->n_leafs; i++) {
+        if (!ggml_gallocr_node_needs_realloc(galloc, graph->leafs[i], &galloc->leaf_allocs[i].leaf)) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: leaf %s is not valid\n", __func__, graph->leafs[i]->name);
+#endif
+            return true;
+        }
+    }
+
     return false;
 }
 
