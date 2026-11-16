@@ -41,6 +41,15 @@ int ggml_live_switch(const char * name, int def) {
     static const char *               path       = getenv("GGML_SWITCH_FILE");
     static long long                  last_check = -1;
     static long long                  last_mtime = -1;
+    // Answers by the address of the name (callers pass literals), valid until the file changes: a kernel dispatch
+    // asks several switches per launch, and a string lookup plus getenv() for each adds up to milliseconds a step.
+    struct answer {
+        const char * name;
+        int          def;
+        int          val;
+    };
+    static constexpr int n_slots = 256;
+    static answer        slots[n_slots];
 
     std::lock_guard<std::mutex> lock(mtx);
     if (path) {
@@ -52,6 +61,9 @@ int ggml_live_switch(const char * name, int def) {
             if (mt != last_mtime) {
                 last_mtime = mt;
                 file_vals.clear();
+                for (auto & a : slots) {
+                    a.name = nullptr;
+                }
                 if (FILE * f = fopen(path, "r")) {
                     char line[256];
                     while (fgets(line, sizeof(line), f)) {
@@ -65,11 +77,24 @@ int ggml_live_switch(const char * name, int def) {
                 }
             }
         }
+    }
+    answer & a = slots[((uintptr_t) name >> 3) % n_slots];
+    if (a.name == name && a.def == def) {
+        return a.val;
+    }
+    int val = def;
+    bool found = false;
+    if (path) {
         const auto it = file_vals.find(name);
         if (it != file_vals.end()) {
-            return it->second;
+            val   = it->second;
+            found = true;
         }
     }
-    const char * e = getenv(name);
-    return e ? atoi(e) : def;
+    if (!found) {
+        const char * e = getenv(name);
+        val = e ? atoi(e) : def;
+    }
+    a = { name, def, val };
+    return val;
 }

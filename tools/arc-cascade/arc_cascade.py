@@ -82,11 +82,18 @@ def plan(a):
         ', %.0f MiB on-disk table' % m['lazy'] if m['lazy'] else '', '; draft head %.0f MiB' % head_w if h else ''))
     L('cards: %s; RAM free now %d MiB, budget %d MiB' % (', '.join('%s %d MiB' % cv for cv in zip(cards, vram)), free, ram_budget))
     if h: out['args'] += ['-md', a.head, '--spec-type', 'draft-mtp', '-ngld', '99', '-bs', '--spec-draft-n-max', '5']
-    if a.copy_drafts:
+    def fixed_base(ub): return m['other'] + 524 + a.ctx * 32 / 1024 + (195 + 0.303 * ub) + ((head_w + 0.62 * ub + a.ctx * 4 / 1024) if h else 0)
+    # copy-drafting is on whenever the model and its wide checking passes fit one card; --copy-drafts / --no-copy-drafts decide otherwise
+    copy = a.copy_drafts
+    if copy is None:
+        copy = m['exps'] + fixed_base(512) + WIDE_PASS_MIB + RESERVE_MIB <= vram[0]
+        L('copy-drafting: %s' % ('on (fits this card with its %d MiB of working memory)' % WIDE_PASS_MIB if copy else
+                                 'off (its %d MiB of working memory does not fit next to everything else; --copy-drafts forces it)' % WIDE_PASS_MIB))
+    if copy:
         # copy-drafting picks its own length, from 8 up to 128 tokens (LLAMA_SPEC_NGRAM_AUTO)
         out['args'] += ['--spec-type', 'ngram-mod', '--spec-ngram-mod-n-min', '16', '--spec-ngram-mod-n-max', '128']
         out['env']['LLAMA_SPEC_NGRAM_AUTO'] = '1'
-    def fixed(ub): return m['other'] + 524 + a.ctx * 32 / 1024 + (195 + 0.303 * ub) + ((head_w + 0.62 * ub + a.ctx * 4 / 1024) if h else 0) + (WIDE_PASS_MIB if a.copy_drafts else 0)
+    def fixed(ub): return fixed_base(ub) + (WIDE_PASS_MIB if copy else 0)
     whole = m['exps'] + fixed(512)
     # 1. one card
     if whole + RESERVE_MIB <= vram[0]:
@@ -158,7 +165,7 @@ ap.add_argument('--threads', type=int, default=12)
 # usage memory, tiers only, off by default: the experts in VRAM and RAM at shutdown are loaded back at the next start
 ap.add_argument('--remember', action='store_true'); ap.add_argument('--usage-file')
 # copy-drafting for edits: long drafts copied from text already in the conversation, checked in wide passes
-ap.add_argument('--copy-drafts', action='store_true')
+ap.add_argument('--copy-drafts', action=argparse.BooleanOptionalAction, default=None)
 # everything after a bare -- goes to llama-server unchanged
 argv = sys.argv[1:]
 extra = []
