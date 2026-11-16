@@ -1,5 +1,6 @@
 #include "llama-context.h"
 
+#include <unistd.h>
 #include <ctime>
 
 #include "ggml.h"
@@ -2186,7 +2187,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 static FILE * llama_scope_file() {
     static FILE * f = [] {
         const char * path = getenv("LLAMA_SCOPE_FILE");
-        FILE * res = path != nullptr && path[0] != '\0' ? fopen(path, "a") : nullptr;
+        // a path that ends in '/' is a folder: each process writes scope-<pid>.jsonl there
+        std::string file = path != nullptr ? path : "";
+        if (!file.empty() && file.back() == '/') {
+            file += "scope-" + std::to_string((long long) getpid()) + ".jsonl";
+        }
+        FILE * res = !file.empty() ? fopen(file.c_str(), "a") : nullptr;
         if (res != nullptr) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);

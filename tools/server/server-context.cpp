@@ -1,3 +1,4 @@
+#include <unistd.h>
 #include <ctime>
 #include "server-context.h"
 #include <atomic>
@@ -70,10 +71,15 @@ static common_speculative_output_limits server_output_limits(const common_params
 
 // Scope timeline, local, off by default (LLAMA_SCOPE_FILE=path): one JSON line each time the server loop enters a phase
 // (0 outside, 1 pre, 2 draft, 3 checkpoint, 4 decode, 5 sample, 6 post), read by tools/arc-cascade/cascade_scope.py
-static void srv_scope(int id) {
+static FILE * srv_scope_file() {
     static FILE * f = [] {
         const char * path = getenv("LLAMA_SCOPE_FILE");
-        FILE * res = path != nullptr && path[0] != '\0' ? fopen(path, "a") : nullptr;
+        // a path that ends in '/' is a folder: each process writes scope-<pid>.jsonl there
+        std::string file = path != nullptr ? path : "";
+        if (!file.empty() && file.back() == '/') {
+            file += "scope-" + std::to_string((long long) getpid()) + ".jsonl";
+        }
+        FILE * res = !file.empty() ? fopen(file.c_str(), "a") : nullptr;
         if (res != nullptr) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
@@ -82,8 +88,22 @@ static void srv_scope(int id) {
         }
         return res;
     }();
-    if (f != nullptr) {
+    return f;
+}
+
+static void srv_scope(int id) {
+    if (FILE * f = srv_scope_file()) {
         fprintf(f, "{\"k\":\"p\",\"id\":%d,\"t\":%lld}\n", id, (long long) ggml_time_us());
+        fflush(f);
+    }
+}
+
+// what the server itself knows about a request, so a viewer needs no client: "m" the model loaded, "r" a request starts,
+// "t" a piece of text is sent, "e" the request ends
+static void srv_scope_event(json ev) {
+    if (FILE * f = srv_scope_file()) {
+        ev["t"] = ggml_time_us();
+        fprintf(f, "%s\n", safe_json_to_str(ev).c_str());
         fflush(f);
     }
 }
@@ -1673,6 +1693,8 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+        srv_scope_event({{"k", "m"}, {"model", params_base.model.path}, {"draft", params_base.speculative.draft.mparams.path},
+                         {"devices", getenv("ONEAPI_DEVICE_SELECTOR") ? getenv("ONEAPI_DEVICE_SELECTOR") : ""}, {"n_ctx", params_base.n_ctx}});
 
         // propagate new defaults back to caller
         params = params_base;
@@ -2180,6 +2202,7 @@ private:
         n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        srv_scope_event({{"k", "r"}, {"task", slot.task->id}, {"n_prompt", slot.task->n_tokens()}});
         return true;
     }
 
@@ -2412,6 +2435,9 @@ private:
         } else {
             res->content = slot.generated.substr(slot.n_sent_text - tkn.text_to_send.size(), tkn.text_to_send.size());
             res->tokens.assign(1, tkn.tok);
+            if (!is_progress && !tkn.text_to_send.empty()) {
+                srv_scope_event({{"k", "t"}, {"s", tkn.text_to_send}});
+            }
         }
 
         res->n_decoded             = slot.stats.n_gen;
@@ -2451,6 +2477,7 @@ private:
 
     void send_final_response(server_slot & slot) {
         auto res = std::make_unique<server_task_result_cmpl_final>();
+        srv_scope_event({{"k", "e"}, {"task", slot.task->id}, {"n", slot.stats.n_gen}, {"draft_n", slot.stats.n_draft_tokens}, {"draft_acc", slot.stats.n_draft_accepted}});
 
         res->id      = slot.task->id;
         res->id_slot = slot.id;
