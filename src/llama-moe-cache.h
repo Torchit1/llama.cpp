@@ -48,6 +48,9 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // local: running totals for the scope timeline: slot hits, misses, RAM tier hits, file reads, bytes read, bytes uploaded
+    void scope_counters(uint64_t out[6]) const;
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

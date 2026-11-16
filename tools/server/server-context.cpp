@@ -1,3 +1,4 @@
+#include <ctime>
 #include "server-context.h"
 #include <atomic>
 #include <thread>
@@ -67,8 +68,29 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
+// Scope timeline, local, off by default (LLAMA_SCOPE_FILE=path): one JSON line each time the server loop enters a phase
+// (0 outside, 1 pre, 2 draft, 3 checkpoint, 4 decode, 5 sample, 6 post), read by tools/arc-cascade/cascade_scope.py
+static void srv_scope(int id) {
+    static FILE * f = [] {
+        const char * path = getenv("LLAMA_SCOPE_FILE");
+        FILE * res = path != nullptr && path[0] != '\0' ? fopen(path, "a") : nullptr;
+        if (res != nullptr) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            fprintf(res, "{\"k\":\"h\",\"src\":\"server\",\"us\":%lld,\"wall_us\":%lld}\n", (long long) ggml_time_us(),
+                    (long long) ts.tv_sec*1000000 + ts.tv_nsec/1000);
+        }
+        return res;
+    }();
+    if (f != nullptr) {
+        fprintf(f, "{\"k\":\"p\",\"id\":%d,\"t\":%lld}\n", id, (long long) ggml_time_us());
+        fflush(f);
+    }
+}
+
 // LLAMA_SRV_PHASE=N: every N speculative cycles print where the server loop's wall time went (ms per cycle)
 static void srv_phase(int id) {
+    srv_scope(id);
     static const int every = getenv("LLAMA_SRV_PHASE") ? atoi(getenv("LLAMA_SRV_PHASE")) : 0;
     if (every <= 0) {
         return;

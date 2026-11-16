@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include <ctime>
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -22,6 +24,8 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+static FILE * llama_scope_file(); // scope timeline, defined below
 
 //
 // llama_context
@@ -1837,6 +1841,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     static const bool dtrace = getenv("LLAMA_DECODE_TRACE") != nullptr; // local timing probe
     const int64_t dt0 = dtrace ? ggml_time_us() : 0;
+    const int64_t sc0 = llama_scope_file() ? ggml_time_us() : 0;
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1884,6 +1889,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const int64_t dt1 = dtrace ? ggml_time_us() : 0;
+    const int64_t sc1 = llama_scope_file() ? ggml_time_us() : 0;
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1895,7 +1901,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const int64_t dt2 = dtrace ? ggml_time_us() : 0;
+    const int64_t sc2 = llama_scope_file() ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (FILE * scope = llama_scope_file()) {
+        uint64_t m[6] = {};
+        if (moe_cache) {
+            moe_cache->scope_counters(m);
+        }
+        fprintf(scope, "{\"k\":\"d\",\"c\":\"%p\",\"layers\":%d,\"n\":%d,\"t0\":%lld,\"t1\":%lld,\"t2\":%lld,\"t3\":%lld,"
+                "\"hit\":%llu,\"miss\":%llu,\"ram\":%llu,\"reads\":%llu,\"read_b\":%llu,\"up_b\":%llu}\n",
+                (const void *) this, (int) model.hparams.n_layer(), (int) ubatch.n_tokens, (long long) sc0, (long long) sc1, (long long) sc2,
+                (long long) ggml_time_us(), (unsigned long long) m[0], (unsigned long long) m[1], (unsigned long long) m[2],
+                (unsigned long long) m[3], (unsigned long long) m[4], (unsigned long long) m[5]);
+        fflush(scope);
+    }
     if (dtrace) {
         const long long dt3 = ggml_time_us();
         fprintf(stderr, "DB %p %d %lld %lld\nDI %p %d %lld %lld\nDC %p %d %lld %lld\n", (const void *) this, (int) ubatch.n_tokens, (long long) dt0, (long long) dt1,
@@ -2158,6 +2177,26 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
         }
     }
     return false; // all sequences use backend sampling
+}
+
+// Scope timeline, local, off by default (LLAMA_SCOPE_FILE=path): one JSON line per ubatch with the host-side times of
+// the decode and what the MoE cache did during it. Read by tools/arc-cascade/cascade_scope.py. Times are ggml_time_us();
+// the first line of each writer ties that clock to the wall clock. The compute time is the time to queue the graph on
+// an asynchronous backend, the rest of the GPU time lands where the result is read (sampling).
+static FILE * llama_scope_file() {
+    static FILE * f = [] {
+        const char * path = getenv("LLAMA_SCOPE_FILE");
+        FILE * res = path != nullptr && path[0] != '\0' ? fopen(path, "a") : nullptr;
+        if (res != nullptr) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            fprintf(res, "{\"k\":\"h\",\"src\":\"llama\",\"us\":%lld,\"wall_us\":%lld}\n", (long long) ggml_time_us(),
+                    (long long) ts.tv_sec*1000000 + ts.tv_nsec/1000);
+            fflush(res);
+        }
+        return res;
+    }();
+    return f;
 }
 
 // local timing probe: LLAMA_DECODE_TRACE=1 prints one line per decode (context, tokens, start and end in us)

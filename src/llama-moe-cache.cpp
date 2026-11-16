@@ -1543,6 +1543,16 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const
 
 llama_moe_cache::~llama_moe_cache() = default;
 
+void llama_moe_cache::scope_counters(uint64_t out[6]) const {
+    const impl & p = *pimpl;
+    out[0] = p.stats_small.hits   + p.stats_large.hits;
+    out[1] = p.stats_small.misses + p.stats_large.misses;
+    out[2] = p.ram_hits;
+    out[3] = p.stage_reads;
+    out[4] = p.stage_bytes;
+    out[5] = p.stats_small.bytes  + p.stats_large.bytes;
+}
+
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);
 }
