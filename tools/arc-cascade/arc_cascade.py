@@ -19,6 +19,7 @@ import argparse, glob, os, shutil, struct, subprocess, sys
 CARDS = {'B70': 32656, 'B580': 12216}          # usable MiB as the driver reports it
 SERVER_RAM_MIB = 3500                         # host memory the server uses beyond the pinned RAM tier
 # context: 32 MiB of VRAM per 1,024 tokens, working memory that grows with it included (Flash-Next at 262K, 16 Nov 2026)
+HOST_KEEP_MIB = 8000                          # host memory never given to the pinned RAM tier
 RESERVE_MIB = 600                             # per card, left free
 TWO_CARD_MARGIN_MIB = 4000                    # extra room when the cache is split over cards (one run so far, at 32000)
 WIDE_PASS_MIB = 700                           # working memory of a wide (up to 128-token) checking pass
@@ -75,7 +76,11 @@ def plan(a):
     vram = [int(v) for v in a.vram_mib.split(',')] if a.vram_mib else [CARDS[c] for c in cards]
     assert len(vram) == len(cards), '--vram-mib needs one value per card'
     free = free_ram_mib()
-    ram_budget = min(a.ram_mib, free) if a.ram_mib else max(0, free - 5000)
+    # The tier is pinned memory, which the host cannot take back: a budget that used all the free RAM froze the machine
+    # (17 Nov). HOST_KEEP_MIB always stays free, whatever --ram-mib asks for.
+    ram_budget = max(0, min(a.ram_mib if a.ram_mib else free, free - HOST_KEEP_MIB))
+    if a.ram_mib and ram_budget < a.ram_mib:
+        out['lines'].append('RAM budget cut from %d to %d MiB: %d MiB are free and %d stay free for the rest of the machine' % (a.ram_mib, ram_budget, free, HOST_KEEP_MIB))
     out = {'lines': [], 'env': {}, 'args': ['-m', a.model, '-fa', 'on', '-c', str(a.ctx)], 'cards': cards[:1], 'ok': True}
     L = out['lines'].append
     L('model: %.0f MiB of experts, %.0f MiB of other weights%s%s' % (m['exps'], m['other'],
