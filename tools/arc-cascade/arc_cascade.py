@@ -135,7 +135,9 @@ def plan(a):
     ub, cache = choice
     cache = int(min(cache, m['exps']) // 100 * 100)
     off_card = m['exps'] - cache
-    ram_tier = int(max(0, min(ram_budget - SERVER_RAM_MIB, off_card)) // 100 * 100)
+    # With preload the RAM tier takes as much of the budget as there are experts: it then also holds the coldest experts
+    # that are on the card, which are the next to be pushed off it, so they do not come back from the file.
+    ram_tier = int(max(0, min(ram_budget - SERVER_RAM_MIB, m['exps'] if a.preload else off_card)) // 100 * 100)
     disk = max(0, off_card - ram_tier)
     if off_card > 0 and ram_tier < min(2000, off_card):
         out['ok'] = False
@@ -144,7 +146,8 @@ def plan(a):
         return out
     L('plan: tiers on %s' % ' + '.join(use))
     L('  VRAM : %.0f MiB of non-expert weights and working memory + %d MiB expert cache' % (fixed(ub), cache))
-    L('  RAM  : %d MiB of experts pinned, most recently used first (server total about %d MiB of the %d MiB budget)' % (ram_tier, ram_tier + SERVER_RAM_MIB, ram_budget))
+    L('  RAM  : %d MiB of experts pinned (%.0f MiB do not fit the card), most recently used first (server total about %d MiB of the %d MiB budget)' % (
+        ram_tier, off_card, ram_tier + SERVER_RAM_MIB, ram_budget))
     L('  disk : %.0f MiB of experts read from the file when needed' % disk)
     L('  prompt batch %d tokens' % ub)
     out['cards'] = use

@@ -1364,6 +1364,23 @@ struct llama_moe_cache::impl {
                     }
                 }
             }
+            // experts a last run's list does not name go to the cold end of the RAM list: loaded if there is room
+            for (size_t il = 0; preload_all && il < usage.size() && il < layers.size(); ++il) {
+                if (layers[il].experts.empty()) {
+                    continue;
+                }
+                const int32_t     n = (int32_t) layers[il].experts[0]->ne[2];
+                std::vector<bool> named(n, false);
+                for (int32_t e : usage[il].vram) { if (e >= 0 && e < n) { named[e] = true; } }
+                for (int32_t e : usage[il].ram)  { if (e >= 0 && e < n) { named[e] = true; } }
+                std::vector<int32_t> rest;
+                for (int32_t e = 0; e < n; ++e) {
+                    if (!named[e]) {
+                        rest.push_back(e);
+                    }
+                }
+                usage[il].ram.insert(usage[il].ram.begin(), rest.begin(), rest.end());
+            }
             usage_warmed.assign(devices.size(), 0);
         }
         if (usage.empty() || usage_warmed[id]) {
@@ -1389,9 +1406,11 @@ struct llama_moe_cache::impl {
             }
             const size_t room = g.lru.n_slots - g.lru.n_filled;
             const double keep = total > room ? (double) room/total : 1.0;
+            std::vector<size_t> dropped(layers.size(), 0); // per layer: how many of its device list went to the RAM list
             for (int32_t il : g.layers) {
                 usage_layer & u = usage[il];
                 const size_t drop = u.vram.size() - (size_t) (u.vram.size()*keep);
+                dropped[il] = drop;
                 u.ram.insert(u.ram.end(), u.vram.begin(), u.vram.begin() + drop);
                 for (size_t i = drop; i < u.vram.size(); i += chunk) {
                     const size_t n = std::min(chunk, u.vram.size() - i);
@@ -1418,9 +1437,17 @@ struct llama_moe_cache::impl {
                 total += usage[il].ram.size();
             }
             const double keep_ram = total > (size_t) r.n_slots ? (double) r.n_slots/total : 1.0;
+            // Room left in the tier takes the coldest experts that are on the device as well: they are the next to be
+            // evicted, and an evicted expert that is not in RAM has to come back from the file.
+            const size_t extra = total < (size_t) r.n_slots && !g.layers.empty() ? ((size_t) r.n_slots - total)/g.layers.size() : 0;
             for (int32_t il : g.layers) {
                 const layer & l = layers[il];
-                const std::vector<int32_t> & list = usage[il].ram;
+                std::vector<int32_t> list = usage[il].ram;
+                {
+                    const std::vector<int32_t> & v = usage[il].vram;
+                    const size_t n_more = std::min(extra, v.size() - dropped[il]);
+                    list.insert(list.begin(), v.begin() + dropped[il], v.begin() + dropped[il] + n_more);
+                }
                 for (size_t i = list.size() - (size_t) (list.size()*keep_ram); i < list.size(); i += chunk) {
                     const size_t n = std::min(chunk, list.size() - i);
                     const uint64_t call_tick = ++r.tick;
