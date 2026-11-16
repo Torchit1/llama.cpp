@@ -18,6 +18,7 @@ import argparse, glob, os, shutil, struct, subprocess, sys
 
 CARDS = {'B70': 32656, 'B580': 12216}          # usable MiB as the driver reports it
 SERVER_RAM_MIB = 3500                         # host memory the server uses beyond the pinned RAM tier
+# context: 32 MiB of VRAM per 1,024 tokens, working memory that grows with it included (Flash-Next at 262K, 16 Nov 2026)
 RESERVE_MIB = 600                             # per card, left free
 TWO_CARD_MARGIN_MIB = 4000                    # extra room when the cache is split over cards (one run so far, at 32000)
 MiB = 2 ** 20
@@ -80,7 +81,7 @@ def plan(a):
         ', %.0f MiB on-disk table' % m['lazy'] if m['lazy'] else '', '; draft head %.0f MiB' % head_w if h else ''))
     L('cards: %s; RAM free now %d MiB, budget %d MiB' % (', '.join('%s %d MiB' % cv for cv in zip(cards, vram)), free, ram_budget))
     if h: out['args'] += ['-md', a.head, '--spec-type', 'draft-mtp', '-ngld', '99', '-bs', '--spec-draft-n-max', '5']
-    def fixed(ub): return m['other'] + 524 + a.ctx * 20 / 1024 + (195 + 0.303 * ub) + ((head_w + 0.62 * ub) if h else 0)
+    def fixed(ub): return m['other'] + 524 + a.ctx * 32 / 1024 + (195 + 0.303 * ub) + ((head_w + 0.62 * ub + a.ctx * 4 / 1024) if h else 0)
     whole = m['exps'] + fixed(512)
     # 1. one card
     if whole + RESERVE_MIB <= vram[0]:
