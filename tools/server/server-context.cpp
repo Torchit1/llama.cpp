@@ -2211,6 +2211,7 @@ private:
             ov.use_ngram_mod = tp.spec_use_ngram_mod;
             ov.ngram_n_min   = tp.spec_ngram_n_min;
             ov.ngram_n_max   = tp.spec_ngram_n_max;
+            ov.ngram_reset   = tp.spec_ngram_reset;
             common_speculative_set_overrides(ov);
             srv_scope_event({{"k", "r"}, {"task", slot.task->id}, {"n_prompt", slot.task->n_tokens()},
                              {"spec", {{"draft_n_max", ov.draft_n_max}, {"use_draft_mtp", ov.use_draft_mtp}, {"use_ngram_mod", ov.use_ngram_mod},

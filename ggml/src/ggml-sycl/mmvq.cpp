@@ -2775,8 +2775,7 @@ static void mul_mat_vec_q_moe(
 // cross-lane reduction; with LPR = 1 there is no reduction at all.
 // GGML_SYCL_MOE_ROW_DOTS: dot products one lane should do per row (default 20, 0 = always the kernel above).
 static int ggml_sycl_moe_row_dots() {
-    static const int v = [] { const char * e = getenv("GGML_SYCL_MOE_ROW_DOTS"); return e ? atoi(e) : 20; }();
-    return v;
+    return ggml_live_switch("GGML_SYCL_MOE_ROW_DOTS", 20);
 }
 
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl, int LPR>
@@ -2865,8 +2864,7 @@ static void launch_mul_mat_vec_q_moe(
 // several tokens route to is decoded once: the first token that names it (the leader) computes the dot products of
 // all of them. Followers do no work. IQ4_NL, IQ2_S, IQ3_XXS and IQ3_S. GGML_SYCL_MOE_WINDOW=0 turns it off.
 static bool ggml_sycl_moe_window_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_SYCL_MOE_WINDOW"); return e ? atoi(e) != 0 : true; }();
-    return on;
+    return ggml_live_switch("GGML_SYCL_MOE_WINDOW", 1) != 0;
 }
 
 static constexpr int GGML_SYCL_MOE_WINDOW_MAX_TOKENS = 8;
@@ -3333,8 +3331,27 @@ bool ggml_sycl_mul_mat_vec_q_id_window(
     int y_rows_per_token, dpct::queue_ptr stream) {
     const bool grid_type = src0_type == GGML_TYPE_IQ2_S || src0_type == GGML_TYPE_IQ3_XXS || src0_type == GGML_TYPE_IQ3_S;
     if ((src0_type != GGML_TYPE_IQ4_NL && !grid_type) || !ggml_sycl_moe_window_enabled() || n_tokens < 2 ||
-        n_tokens > GGML_SYCL_MOE_WINDOW_MAX_TOKENS || ncols % (grid_type ? QK_K : QK4_NL) != 0) {
+        ncols % (grid_type ? QK_K : QK4_NL) != 0) {
         return false;
+    }
+    if (n_tokens > GGML_SYCL_MOE_WINDOW_MAX_TOKENS) {
+        // a wider step goes as several windows of near-equal size, each with its own schedule; an expert shared by
+        // two windows is decoded once in each
+        const int n_win = (n_tokens + GGML_SYCL_MOE_WINDOW_MAX_TOKENS - 1) / GGML_SYCL_MOE_WINDOW_MAX_TOKENS;
+        int       t0    = 0;
+        size_t    fol0  = 0;
+        for (int w = 0; w < n_win; ++w) {
+            const int nt = (n_tokens - t0) / (n_win - w);
+            int32_t * f  = fol + fol0;
+            ggml_sycl_mul_mat_vec_q_id_window(
+                src0_type, vx_base, (const char *) vy_base + (size_t) t0 * y_rows_per_token * y_row_bytes,
+                (const int32_t *) ((const char *) ids_base + (size_t) t0 * ids_token_stride), ids_token_stride,
+                fol_build ? f : nullptr, f, (float *) ((char *) dst_base + (size_t) t0 * dst_token_stride), ncols, nrows,
+                n_ids, nt, expert_weight_stride, dst_row_stride, dst_token_stride, y_row_bytes, y_rows_per_token, stream);
+            t0   += nt;
+            fol0 += (size_t) n_ids * nt * nt;
+        }
+        return true;
     }
     if (fol_build) { // nullptr: fol already holds the schedule for these ids
         launch_moe_window_schedule(ids_base, ids_token_stride, n_ids, n_tokens, fol_build, stream);

@@ -5789,8 +5789,10 @@ static bool ggml_sycl_mul_mat_id_mmvq_eligible(
     const int64_t ne12 = src1->ne[2];
 
     // a few tokens (e.g. the verify step of speculative decoding) stay on the mat-vec kernels, one launch per token.
-    // GGML_SYCL_MMID_MMVQ_MAX_TOKENS=1 restores the single-token limit.
-    static const int64_t max_tokens = [] { const char * e = getenv("GGML_SYCL_MMID_MMVQ_MAX_TOKENS"); return e ? (int64_t) atoi(e) : 8; }();
+    // Up to 8 tokens go as one window, wider steps as several; measured on a B70 (IQ4_NL / IQ2_S experts) that beats
+    // the batch path up to about 33 tokens and loses from 41. GGML_SYCL_MMID_MMVQ_MAX_TOKENS=1 restores the
+    // single-token limit.
+    const int64_t max_tokens = ggml_live_switch("GGML_SYCL_MMID_MMVQ_MAX_TOKENS", 36);
     if (ne12 < 1 || ne12 > max_tokens) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
@@ -6986,8 +6988,7 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
 
 // GGML_SYCL_FUSE_BF16_SCALE=0 turns the bf16 MUL_MAT + SCALE fusion off
 static bool ggml_sycl_fuse_bf16_mul_mat_scale() {
-    static const bool on = [] { const char * e = getenv("GGML_SYCL_FUSE_BF16_SCALE"); return e ? atoi(e) != 0 : true; }();
-    return on;
+    return ggml_live_switch("GGML_SYCL_FUSE_BF16_SCALE", 1) != 0;
 }
 
 // BF16 mat-vec followed by a scale and/or SiLU / sigmoid (and a second scale): the mat-vec kernel does it all in one
@@ -7644,8 +7645,45 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
 }
 #endif
 
+// The kernel-choice knobs below are read once at start-up; this re-reads them through ggml_live_switch() at the
+// start of every graph, so a running server can try another value without a reload (see GGML_SWITCH_FILE).
+static void ggml_sycl_refresh_live_knobs() {
+    struct knob {
+        const char * name;
+        int *        val;
+        int          init;
+    };
+    static knob knobs[] = {
+        { "GGML_SYCL_ENABLE_DNN",        &g_ggml_sycl_enable_dnn,        g_ggml_sycl_enable_dnn        },
+        { "GGML_SYCL_FA_ONEDNN",         &g_ggml_sycl_fa_onednn,         g_ggml_sycl_fa_onednn         },
+        { "GGML_SYCL_ENABLE_MKL_FA",     &g_ggml_sycl_enable_mkl_fa,     g_ggml_sycl_enable_mkl_fa     },
+        { "GGML_SYCL_FA_DPAS",           &g_ggml_sycl_fa_dpas,           g_ggml_sycl_fa_dpas           },
+        { "GGML_SYCL_GDN_STATE_GATHER",  &g_ggml_sycl_gdn_state_gather,  g_ggml_sycl_gdn_state_gather  },
+        { "GGML_SYCL_FUSE_CONV_WINDOW",  &g_ggml_sycl_fuse_conv_window,  g_ggml_sycl_fuse_conv_window  },
+        { "GGML_SYCL_ENABLE_ESIMD",      &g_ggml_sycl_enable_esimd,      g_ggml_sycl_enable_esimd      },
+        { "GGML_SYCL_MMVQ_WIDE",         &g_ggml_sycl_mmvq_wide,         g_ggml_sycl_mmvq_wide         },
+        { "GGML_SYCL_ENABLE_XMX_ESIMD",  &g_ggml_sycl_enable_xmx_esimd,  g_ggml_sycl_enable_xmx_esimd  },
+        { "GGML_SYCL_XMX_MAX_COLS",      &g_ggml_sycl_xmx_max_cols,      g_ggml_sycl_xmx_max_cols      },
+        { "GGML_SYCL_XMX_GLU_MAX_COLS",  &g_ggml_sycl_xmx_glu_max_cols,  g_ggml_sycl_xmx_glu_max_cols  },
+        { "GGML_SYCL_PRIORITIZE_DMMV",   &g_ggml_sycl_prioritize_dmmv,   g_ggml_sycl_prioritize_dmmv   },
+        { "GGML_SYCL_XMX_GATHER_TYPES",  &g_ggml_sycl_xmx_gather_types,  g_ggml_sycl_xmx_gather_types  },
+        { "GGML_SYCL_XMX_GATHER_SHAPES", &g_ggml_sycl_xmx_gather_shapes, g_ggml_sycl_xmx_gather_shapes },
+        { "GGML_SYCL_MMID_SCHED",        &g_ggml_sycl_mmid_sched,        g_ggml_sycl_mmid_sched        },
+        { "GGML_SYCL_SPARSE_FA",         &g_ggml_sycl_enable_sparse_fa,  g_ggml_sycl_enable_sparse_fa  },
+        { "GGML_SYCL_SPARSE_FA_MARGIN",  &g_ggml_sycl_sparse_fa_margin,  g_ggml_sycl_sparse_fa_margin  },
+    };
+    for (auto & k : knobs) {
+        *k.val = ggml_live_switch(k.name, k.init);
+    }
+    g_ggml_sycl_xmx_max_cols     = std::max(0, g_ggml_sycl_xmx_max_cols);
+    g_ggml_sycl_xmx_glu_max_cols = std::clamp(g_ggml_sycl_xmx_glu_max_cols, 0, GGML_SYCL_XMX_GLU_MAX_COLS);
+    g_ggml_sycl_mmid_sched &= 3;
+}
+
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+
+    ggml_sycl_refresh_live_knobs();
 
     // set the device on every call: a graph replay does not go through
     // ggml_backend_sycl_graph_compute_impl()

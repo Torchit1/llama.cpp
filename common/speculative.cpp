@@ -2242,6 +2242,10 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
 
+        if (g_spec_overrides.ngram_reset == 1) {
+            mod.reset(); // this request must not copy from the answers of earlier ones
+        }
+
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
             return;

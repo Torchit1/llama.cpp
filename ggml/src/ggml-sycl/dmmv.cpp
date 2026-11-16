@@ -1929,8 +1929,7 @@ bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(enum ggml_type src0_type
 // in 64-value chunks; BF16 is widened to F32 in the kernel and the activations are read as they are.
 // GGML_SYCL_BF16_ESIMD=0 turns it off.
 static bool ggml_sycl_bf16_esimd_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_SYCL_BF16_ESIMD"); return e ? atoi(e) != 0 : true; }();
-    return on;
+    return ggml_live_switch("GGML_SYCL_BF16_ESIMD", 1) != 0;
 }
 
 template <int WG>
@@ -2095,7 +2094,7 @@ static void launch_mul_mat_vec_bf16_sycl_esimd_ncols(const void * vx, const floa
 bool ggml_sycl_mul_mat_bf16_ncols_esimd(const void * vx, const float * y, float * dst, int ncols, int nrows,
                                         int n_cols_dst, size_t y_stride, size_t dst_stride, dpct::queue_ptr stream,
                                         ggml_sycl_bf16_post out_scale, int min_cols) {
-    static const int max_cols = [] { const char * e = getenv("GGML_SYCL_BF16_ESIMD_NCOLS"); return e ? atoi(e) : 8; }();
+    const int max_cols = ggml_live_switch("GGML_SYCL_BF16_ESIMD_NCOLS", 8);
     if (!g_ggml_sycl_enable_esimd || !ggml_sycl_bf16_esimd_enabled() || n_cols_dst < min_cols || n_cols_dst > max_cols ||
         n_cols_dst > 8 || ncols % 64 != 0) {
         return false;
