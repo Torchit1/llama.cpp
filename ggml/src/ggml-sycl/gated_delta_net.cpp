@@ -79,6 +79,19 @@ static void launch_gated_delta_net_esimd(const float *   q,
 }
 #endif
 
+// sum over the lanes of a sub-group: the group algorithm when the sub-group is the whole warp (GGML_SYCL_GDN_REDUCE=0
+// at build time keeps the chain of shuffles), which is what the recurrence spends most of its time in
+#ifndef GGML_SYCL_GDN_REDUCE
+#define GGML_SYCL_GDN_REDUCE 1
+#endif
+template <int width> static __dpct_inline__ float gdn_reduce_sum(float x) {
+    if constexpr (GGML_SYCL_GDN_REDUCE && width == WARP_SIZE) {
+        return sycl::reduce_over_group(sycl::ext::oneapi::this_work_item::get_sub_group(), x, sycl::plus<float>());
+    } else {
+        return warp_reduce_sum<width>(x);
+    }
+}
+
 template <int S_v, bool KDA, bool keep_rs_t>
 void gated_delta_net_sycl(const float *     q,
                           const float *     k,
@@ -160,7 +173,7 @@ void gated_delta_net_sycl(const float *     q,
                 const int i = r * warp_size + lane;
                 kv_shard += s_shard[r] * k_t[i];
             }
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+            float kv_col = gdn_reduce_sum<warp_size>(kv_shard);
 
             // delta[col] = (v[col] - g * kv[col]) * beta
             float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
@@ -175,7 +188,7 @@ void gated_delta_net_sycl(const float *     q,
                 attn_partial += s_shard[r] * q_t[i];
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+            float attn_col = gdn_reduce_sum<warp_size>(attn_partial);
 
             if (lane == 0) {
                 attn_data[col] = attn_col * scale;
@@ -189,7 +202,7 @@ void gated_delta_net_sycl(const float *     q,
                 kv_shard += sycl::native::exp(g_t[i]) * s_shard[r] * k_t[i];
             }
 
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+            float kv_col = gdn_reduce_sum<warp_size>(kv_shard);
 
             // delta[col] = (v[col] - kv[col]) * beta
             float delta_col = (v_t[col] - kv_col) * beta_val;
@@ -204,7 +217,7 @@ void gated_delta_net_sycl(const float *     q,
                 attn_partial += s_shard[r] * q_t[i];
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+            float attn_col = gdn_reduce_sum<warp_size>(attn_partial);
 
             if (lane == 0) {
                 attn_data[col] = attn_col * scale;
