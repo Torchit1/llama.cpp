@@ -448,6 +448,13 @@ struct ggml_tensor_extra_gpu {
 extern int g_ggml_sycl_use_level_zero_api;
 extern int g_ggml_sycl_bmg_vram_check;
 bool sycl_get_mem_info(int device, size_t * free, size_t * total);
+// Called when a device buffer does not fit: frees device memory that is kept only to save time and returns true if it
+// freed any. Runs under the allocation lock, so it must free with sycl::free, not ggml_sycl_free_device.
+extern bool (*g_ggml_sycl_low_mem_hook)(int device);
+// Called when a device buffer is freed, before its memory goes: whatever is kept about tensors in [ptr, ptr + size) has
+// to be dropped, as the next buffer may get the same addresses. Runs under the allocation lock.
+extern void (*g_ggml_sycl_free_hook)(int device, const void * ptr, size_t size);
+
 void * ggml_sycl_malloc_device(size_t size, sycl::queue &q,
                                ggml_sycl_mem_type type = GGML_SYCL_MEM_DIRECT);
 void ggml_sycl_free_device(void *ptr, sycl::queue &q);

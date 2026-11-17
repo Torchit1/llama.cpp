@@ -24,6 +24,7 @@
 #include <optional>
 #include <stdint.h>
 #include <stdio.h>
+#include <map>
 #include <vector>
 #include <map>
 #include <set>
@@ -70,6 +71,17 @@
 #include "ggml-sycl/fwht.hpp"
 #include "ggml-sycl/fused-gemm.hpp"
 #include "ggml-sycl/gemm.hpp"
+#include "ggml-sycl/rot8.hpp"
+
+// GGML_SYCL_Q4_0_ROT8=1: prompt batches multiply through rotated int8 values (rot8.hpp)
+static bool ggml_sycl_rot8_on() {
+    static const bool on = getenv("GGML_SYCL_Q4_0_ROT8") != nullptr && atoi(getenv("GGML_SYCL_Q4_0_ROT8")) != 0;
+    return on;
+}
+static int ggml_sycl_rot8_min_cols() {
+    static const int n = getenv("GGML_SYCL_Q4_0_ROT8_MIN_COLS") != nullptr ? atoi(getenv("GGML_SYCL_Q4_0_ROT8_MIN_COLS")) : 64;
+    return n;
+}
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/mem.hpp"
 #include "ggml-sycl/norm.hpp"
@@ -822,8 +834,12 @@ struct ggml_backend_sycl_buffer_context {
         drop_host_staging();
         if (dev_ptr != nullptr) {
             ggml_sycl_set_device(device);
-            if (is_usm_system)
+            if (is_usm_system) {
+                if (g_ggml_sycl_free_hook) {
+                    g_ggml_sycl_free_hook(device, dev_ptr, 0); // size unknown here: everything kept for the device goes
+                }
                 free_aligned_mem_host(dev_ptr);
+            }
             else
                 SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(dev_ptr, *stream)));
         }
@@ -3369,6 +3385,25 @@ inline void ggml_sycl_op_mul_mat_sycl(
     }
 #endif
 
+#if GGML_SYCL_DNNL
+    // the rotated int8 matmul for weights of the other quantized types, when their converted form is kept (rot8.hpp)
+    if (ggml_sycl_rot8_on() && ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_Q4_0 && use_fp16 && g_ggml_sycl_enable_dnn && src1->type == GGML_TYPE_F32 &&
+        src1_ncols >= ggml_sycl_rot8_min_cols() && ggml_is_contiguous(src0) && row_low == 0 && row_diff == src0->ne[1] && ldc == row_diff &&
+        ggml_sycl_src1_f16_ok(dst) && ggml_prec_get_acc(dst) == GGML_PREC_UNDEFINED) {
+        if (ggml_sycl_rot8::wanted(src0_dd_i, (int) ne00)) {
+            const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst);
+            if (to_fp16_sycl != nullptr) {
+                ggml_sycl_pool_alloc<sycl::half> w16(ctx.pool(), (size_t) row_diff * ne00);
+                to_fp16_sycl(src0_dd_i, w16.get(), row_diff * ne00, stream);
+                ggml_sycl_rot8::keep(ctx, src0_dd_i, w16.get(), (int) ne00, (int) row_diff, stream);
+            }
+        }
+        if (ggml_sycl_rot8::mul_mat_kept(ctx, src0_dd_i, src1_ddf_i, src1, dst_dd_i, (int) src1_ncols, (int) ne00, (int) row_diff, stream)) {
+            return;
+        }
+    }
+#endif
+
     // dequantize inside the GEMM instead of writing the f16 weights out and reading them back; src1
     // goes in its own type, so there is no separate conversion pass. The A stage
     // decodes the weight bytes in place, so an installed persistent reorder must be
@@ -3393,11 +3428,17 @@ inline void ggml_sycl_op_mul_mat_sycl(
         g_ggml_sycl_enable_dnn && g_ggml_sycl_q4_0_u4_gemm && ggml_sycl_dnnl_has_q4_0_u4_gemm(ggml_sycl_get_device()) &&
         ggml_is_contiguous(src0) && row_low == 0 && row_diff == src0->ne[1] && ldc == row_diff && ne00 % QK4_0 == 0 &&
         ne00 * src0->ne[1] >= GGML_SYCL_Q4_0_U4_GEMM_MIN_WEIGHTS &&
-        dst->op_params[0] == GGML_PREC_DEFAULT) {
+        ggml_sycl_src1_f16_ok(dst)) {
         const int nrows = (int) row_diff;
         const int nb    = (int) (ne00 / QK4_0);
         const int K     = (int) ne00;
         const sycl::half * d = (const sycl::half *) ((const char *) src0_dd_i + (size_t) row_diff * ne00 / 2);
+
+        // GGML_SYCL_Q4_0_ROT8=1: rotated int8 matmul for prompt batches, see rot8.hpp
+        if (ggml_sycl_rot8_on() && src1_ncols >= ggml_sycl_rot8_min_cols() &&
+            ggml_sycl_rot8::mul_mat(ctx, src0_dd_i, src1_ddf_i, src1, dst_dd_i, (int) src1_ncols, K, nrows, stream)) {
+            return;
+        }
 
         ggml_sycl_pool_alloc<sycl::half> scales(ctx.pool(), (size_t) nb * nrows);
         ggml_sycl_pool_alloc<sycl::half> act(ctx.pool(), (size_t) src1_ncols * ne10);
@@ -5432,7 +5473,7 @@ static bool ggml_sycl_reorder_for_q4_0_u4_gemm(ggml_backend_sycl_context & ctx, 
            src0->type == GGML_TYPE_Q4_0 && ggml_is_contiguous(src0) && src0->ne[0] % QK4_0 == 0 &&
            src0->ne[0] * src0->ne[1] >= GGML_SYCL_Q4_0_U4_GEMM_MIN_WEIGHTS &&
            src1->type == GGML_TYPE_F32 && src1->ne[1] > 32 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-           ggml_sycl_src1_f16_ok(dst) && dst->op_params[0] == GGML_PREC_DEFAULT;
+           ggml_sycl_src1_f16_ok(dst);
 }
 #endif
 
@@ -7324,6 +7365,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
     }
+#if GGML_SYCL_DNNL
+    ggml_sycl_rot8::new_graph(sycl_ctx->device);
+#endif
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (hopt) {
@@ -7489,7 +7533,84 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 
         if (hopt) { hpre += ggml_time_us() - ht; hpre_n++; }
+#if GGML_SYCL_DNNL
+        // a gate and an up matmul followed by their SwiGLU: the rotated int8 matmuls can do it in their output step. The
+        // one that is the gate writes silu(gate); the second of the two multiplies by the first and writes the GLU's output
+        static int                 rot8_glu_second = -1;      // index of the second matmul of a pair in progress
+        static const ggml_tensor * rot8_glu_first  = nullptr; // the first matmul
+        static bool                rot8_glu_first_is_gate = false, rot8_glu_first_done = false;
+        int rot8_glu = 0; // 1: this node is the first of a pair, 2: the second
+        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_rot8_on() && g_ggml_sycl_enable_fusion) {
+            if (rot8_glu_second == i && rot8_glu_first == cgraph->nodes[i - 1]) {
+                const ggml_tensor * glu = cgraph->nodes[i + 1];
+                rot8_glu = 2;
+                if (rot8_glu_first_is_gate) {
+                    if (rot8_glu_first_done) {
+                        ggml_sycl_rot8::offer_glu(sycl_ctx->device, false, (const float *) rot8_glu_first->data, (float *) glu->data);
+                    } else {
+                        rot8_glu = 0; // the gate was not taken with its silu: nothing is fused
+                    }
+                } else {
+                    ggml_sycl_rot8::offer_glu(sycl_ctx->device, true, (const float *) rot8_glu_first->data, (float *) glu->data);
+                }
+            } else if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 2]->op == GGML_OP_GLU &&
+                       ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { i + 2 })) {
+                const ggml_tensor * glu = cgraph->nodes[i + 2];
+                const ggml_tensor * nxt = cgraph->nodes[i + 1];
+                const bool pair = (glu->src[0] == node && glu->src[1] == nxt) || (glu->src[0] == nxt && glu->src[1] == node);
+                if (pair && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && node->type == GGML_TYPE_F32 && nxt->type == GGML_TYPE_F32 &&
+                    glu->type == GGML_TYPE_F32 && ggml_are_same_shape(node, nxt) && ggml_are_same_shape(node, glu) && ggml_is_contiguous(node) &&
+                    ggml_is_contiguous(nxt) && ggml_is_contiguous(glu) && node->src[1]->ne[1] >= ggml_sycl_rot8_min_cols()) {
+                    rot8_glu               = 1;
+                    rot8_glu_second        = i + 1;
+                    rot8_glu_first         = node;
+                    rot8_glu_first_is_gate = glu->src[0] == node;
+                    rot8_glu_first_done    = false;
+                    if (rot8_glu_first_is_gate) {
+                        ggml_sycl_rot8::offer_glu(sycl_ctx->device, true, nullptr, nullptr);
+                    }
+                }
+            }
+        }
+        // a matmul followed by the ADD of its result: the rotated int8 matmul can add while it applies its scales
+        bool rot8_add = false;
+        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_rot8_on() && g_ggml_sycl_enable_fusion &&
+            ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+            const ggml_tensor * add   = cgraph->nodes[i + 1];
+            const ggml_tensor * other = add->src[0] == node ? add->src[1] : add->src[0];
+            if ((add->src[0] == node) != (add->src[1] == node) && other->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 &&
+                node->type == GGML_TYPE_F32 && ggml_are_same_shape(other, node) && ggml_are_same_shape(add, node) &&
+                ggml_is_contiguous(other) && ggml_is_contiguous(add) && ggml_is_contiguous(node)) {
+                ggml_sycl_rot8::offer_add(sycl_ctx->device, (const float *) other->data, (float *) add->data);
+                rot8_add = true;
+            }
+        }
+#endif
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+#if GGML_SYCL_DNNL
+        if (rot8_add && ggml_sycl_rot8::take_add(sycl_ctx->device)) {
+            i++; // the ADD is done
+        }
+        if (rot8_glu == 1) {
+            rot8_glu_first_done = ggml_sycl_rot8::take_glu(sycl_ctx->device);
+            if (rot8_glu_first_is_gate && !rot8_glu_first_done) {
+                rot8_glu_second = -1; // the gate is as the graph expects it: the pair runs unfused
+            }
+        } else if (rot8_glu == 2) {
+            const bool done = ggml_sycl_rot8::take_glu(sycl_ctx->device);
+            rot8_glu_second = -1;
+            if (done) {
+                i++; // the GLU is done
+            } else if (rot8_glu_first_is_gate) {
+                // the gate already holds silu(gate): finish the GLU here
+                const float * g = (const float *) rot8_glu_first->data;
+                const float * u = (const float *) node->data;
+                float *       o = (float *) cgraph->nodes[i + 1]->data;
+                sycl_ctx->stream()->parallel_for(sycl::range<1>((size_t) ggml_nelements(node)), [=](sycl::id<1> j) { o[j] = g[j] * u[j]; });
+                i++;
+            }
+        }
+#endif
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
