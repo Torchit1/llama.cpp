@@ -187,6 +187,7 @@ struct moe_cache_lru {
     struct fill {
         int32_t expert;
         int32_t slot;
+        int32_t evicted = -1; // key of the expert that held the slot until now, -1 if it was empty
     };
 
     // give a slot to each expert selected by ids (n_tokens tokens) in layer il
@@ -323,6 +324,7 @@ struct moe_cache_lru {
         std::sort(misses.begin(), misses.end());
         for (int32_t e : misses) {
             const int32_t s = victim(il);
+            const int32_t evicted = key_of[s];
             if (key_of[s] >= 0) {
                 slot_map[key_layer(key_of[s])][key_expert(key_of[s])] = empty;
             } else {
@@ -332,7 +334,7 @@ struct moe_cache_lru {
             key_of[s] = key;
             slots[e]  = s;
             move(s, class_of(key));
-            fills.push_back({ e, s });
+            fills.push_back({ e, s, evicted });
         }
         clock[il] += n_tokens;
         return true;
@@ -545,6 +547,7 @@ struct llama_moe_cache::impl {
     };
     std::vector<ram_tier> ram;       // per group
     size_t                ram_hits  = 0;
+    size_t                ram_saves = 0; // experts copied from the device into the RAM tier when the device evicted them
     size_t                tail_skipped = 0;
     size_t                ram_reads = 0;
 
@@ -568,7 +571,16 @@ struct llama_moe_cache::impl {
             r.n_slots = r.slot_bytes > 0 ? (int32_t) (budget/r.slot_bytes) : 0;
             // at least two layers' worth of experts: one call can then always place every expert it touches, which the
             // CPU part relies on (its ids are RAM slots, there is no fallback once the graph reads the RAM bank)
-            if (r.n_slots >= 2*(int32_t) g.ref[0]->ne[2]) {
+            // Without a CPU part a call only needs room for the experts it loads and the ones it saves from the device, so a
+            // small group keeps its tier: a group without one reads every miss from the file.
+            const int32_t n_min = cpu_share > 0 ? 2*(int32_t) g.ref[0]->ne[2] : 192;
+            if (r.n_slots < n_min && cpu_share == 0 && mib > 0 && r.slot_bytes > 0) {
+                // a small group: the few slots a call needs, a little over its share of the budget
+                LLAMA_LOG_WARN("llama_moe_cache: group %zu: RAM tier raised from its share of %d experts to %d (%.0f MiB over the budget)\n", ig,
+                               r.n_slots, n_min, (n_min - r.n_slots)*r.slot_bytes/1024.0/1024.0);
+                r.n_slots = n_min;
+            }
+            if (r.n_slots >= n_min) {
                 ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
                 r.buf.reset(ggml_backend_buft_alloc_buffer(host ? host : ggml_backend_cpu_buffer_type(), (size_t) r.n_slots*r.slot_bytes));
             }
@@ -590,7 +602,7 @@ struct llama_moe_cache::impl {
                     r.bank.push_back(b);
                     off += (size_t) r.n_slots*t->nb[2];
                 }
-                LLAMA_LOG_INFO("llama_moe_cache: RAM tier of group %zu: %d experts, %.2f MiB pinned\n", ig, r.n_slots, r.n_slots*r.slot_bytes/1024.0/1024.0);
+                LLAMA_LOG_WARN("llama_moe_cache: RAM tier of group %zu: %d experts, %.2f MiB pinned\n", ig, r.n_slots, r.n_slots*r.slot_bytes/1024.0/1024.0);
             } else {
                 r.n_slots = 0;
             }
@@ -611,7 +623,10 @@ struct llama_moe_cache::impl {
 
     // RAM slot of (layer il, expert e): looked up, or taken from the least recently used of the next 64 slots that this
     // call does not use. read is set when the expert has to be read from the file into the slot.
-    int32_t ram_slot(ram_tier & r, int32_t il, int32_t e, uint64_t call_tick, bool & read) {
+    // With lru, a slot is only taken from an expert that is on the device as well (or from an empty one): an expert whose
+    // only copy outside the file is in RAM stays, so nothing has to come back from the file. If every such slot is in
+    // use by this call, any slot is taken as before.
+    int32_t ram_slot(ram_tier & r, int32_t il, int32_t e, uint64_t call_tick, bool & read, const moe_cache_lru * lru = nullptr) {
         const int64_t key = ((int64_t) il << 20) | e;
         auto it = r.slot_of.find(key);
         int32_t s;
@@ -631,6 +646,13 @@ struct llama_moe_cache::impl {
                 r.hand = (r.hand + 1) % r.n_slots;
                 if (r.stamp[cand] == call_tick) {
                     continue;
+                }
+                if (lru != nullptr && k < 3*(int64_t) r.n_slots && r.key_of[cand] >= 0) {
+                    const int32_t cl = (int32_t) (r.key_of[cand] >> 20);
+                    const int32_t ce = (int32_t) (r.key_of[cand] & 0xfffff);
+                    if (lru->slot_map[cl] == nullptr || lru->slot_map[cl][ce] == lru->empty) {
+                        continue; // not on the device: this is its only copy outside the file
+                    }
                 }
                 if (r.ref[cand] > 0) {
                     r.ref[cand]--;
@@ -1170,9 +1192,11 @@ struct llama_moe_cache::impl {
 #endif
                     jobs.push_back({ src, dst, expert_size });
                 };
+                size_t tr_file = 0, tr_evicted = 0, tr_saved = 0, tr_in_ram = 0; // local probe, LLAMA_MOE_READ_TRACE=1
                 for (size_t i = 0; i < fills.size(); ++i) {
                     bool    read = true;
-                    int32_t s    = use_ram ? ram_slot(r, il, fills[i].expert, call_tick, read) : -1;
+                    int32_t s    = use_ram ? ram_slot(r, il, fills[i].expert, call_tick, read, &g.lru) : -1;
+                    tr_file += read;
                     for (size_t ip : file_ips) {
                         const size_t expert_size = l.experts[ip]->nb[2];
                         uint8_t * dst = use_ram ? r.base + r.bank_off[ip] + (size_t) s*expert_size : (stage ? stage + stage_offs : nullptr);
@@ -1186,11 +1210,49 @@ struct llama_moe_cache::impl {
                         stage_offs += use_ram ? 0 : expert_size;
                     }
                 }
+                // An expert this call pushes off the device is copied into the RAM tier first, unless it is there
+                // already: with that, every expert is on the device or in RAM and none comes back from the file.
+                // LLAMA_MOE_RAM_SAVE=0 turns it off.
+                static const bool ram_save = getenv("LLAMA_MOE_RAM_SAVE") == nullptr || atoi(getenv("LLAMA_MOE_RAM_SAVE")) != 0;
+                if (use_ram && ram_save && file_ips.size() == l.experts.size()) {
+                    for (const auto & f : fills) {
+                        if (f.evicted < 0) {
+                            continue;
+                        }
+                        tr_evicted++;
+                        const int32_t el = g.lru.key_layer(f.evicted);
+                        const int32_t ee = g.lru.key_expert(f.evicted);
+                        if (r.slot_of.count(((int64_t) el << 20) | ee) > 0) {
+                            tr_in_ram++;
+                            continue;
+                        }
+                        tr_saved++;
+                        bool          read = true;
+                        const int32_t s    = ram_slot(r, el, ee, call_tick, read, &g.lru);
+                        for (size_t ip = 0; ip < g.banks.size(); ++ip) {
+                            const size_t expert_size = l.experts[ip]->nb[2];
+                            ggml_backend_tensor_get(g.banks[ip], r.base + r.bank_off[ip] + (size_t) s*expert_size, (size_t) f.slot*expert_size, expert_size);
+                        }
+                        ram_saves++;
+                    }
+                }
+                {
+                    static const bool trace_reads = getenv("LLAMA_MOE_READ_TRACE") != nullptr;
+                    if (trace_reads && !fills.empty()) {
+                        size_t n_evict_all = 0;
+                        for (const auto & f : fills) {
+                            n_evict_all += f.evicted >= 0;
+                        }
+                        fprintf(stderr, "MOETRACE il=%d fills=%zu from_file=%zu evicted=%zu already_in_ram=%zu saved=%zu cpu=%zu ram_slots=%d use_ram=%d all_file=%d\n",
+                                il, fills.size(), tr_file, n_evict_all, tr_in_ram, tr_saved, cpu.size(), r.n_slots, (int) use_ram,
+                                (int) (file_ips.size() == l.experts.size()));
+                    }
+                }
                 if (use_ram && has_cpu && file_ips.size() == l.experts.size()) {
                     int32_t * cpu_map = (int32_t *) l.cpu_map->data;
                     for (const auto & f : cpu) {
                         bool          read = true;
-                        const int32_t s    = ram_slot(r, il, f.expert, call_tick, read);
+                        const int32_t s    = ram_slot(r, il, f.expert, call_tick, read, &g.lru);
                         if (read) {
                             for (size_t ip : file_ips) {
                                 queue_read(ip, f.expert, r.base + r.bank_off[ip] + (size_t) s*l.experts[ip]->nb[2]);
@@ -1561,7 +1623,7 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: tail skip: %zu misses neither fetched nor computed\n", tail_skipped);
         }
         if (stage_reads > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: disk tier: %zu expert tensors read from the file, %.2f MiB; RAM tier: %zu hits\n", stage_reads, stage_bytes/1024.0/1024.0, ram_hits);
+            LLAMA_LOG_INFO("llama_moe_cache: disk tier: %zu expert tensors read from the file, %.2f MiB; RAM tier: %zu hits, %zu experts saved from the device\n", stage_reads, stage_bytes/1024.0/1024.0, ram_hits, ram_saves);
         }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
