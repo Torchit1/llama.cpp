@@ -8087,6 +8087,54 @@ static std::string var_to_str(mul_mat_add_mode mode) {
 }
 
 // mul_mat followed by an add of a residual, which backends may fuse into the mat-mul
+// swiglu(mul_mat(gate weights, x), mul_mat(up weights, x)): the feed-forward pair, which a backend may fuse
+struct test_mul_mat_glu : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool    up_first; // the up matmul comes first in the graph
+
+    test_mul_mat_glu(ggml_type type_a, int64_t m, int64_t n, int64_t k, bool up_first = false)
+        : type_a(type_a), m(m), n(n), k(k), up_first(up_first) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, up_first);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_GLU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wg = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(wg, "wg");
+        ggml_set_name(wu, "wu");
+        ggml_set_name(x, "x");
+        ggml_tensor * gate;
+        ggml_tensor * up;
+        if (up_first) {
+            up   = ggml_mul_mat(ctx, wu, x);
+            gate = ggml_mul_mat(ctx, wg, x);
+        } else {
+            gate = ggml_mul_mat(ctx, wg, x);
+            up   = ggml_mul_mat(ctx, wu, x);
+        }
+        ggml_tensor * out = ggml_glu_split(ctx, gate, up, GGML_GLU_OP_SWIGLU);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_add : public test_case {
     const ggml_type type_a;
     const int64_t m;
@@ -11953,6 +12001,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
+
+    // prompt batches over a K that is a multiple of 1024, where a backend may multiply rounded values (the rotated int8
+    // matmul of the SYCL backend), alone, followed by an ADD and as the gate and up pair of a SwiGLU
+    for (int64_t n : {64, 96, 256}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, n, 1024, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 640, n, 2048, {1, 1}, {1, 1}));
+        }
+        for (mul_mat_add_mode mode : {MUL_MAT_ADD_MM_RES, MUL_MAT_ADD_RES_MM, MUL_MAT_ADD_RES_INPLACE}) {
+            test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_Q4_0, 1024, n, 1024, mode));
+        }
+        test_cases.emplace_back(new test_mul_mat_glu(GGML_TYPE_Q4_0, 1024, n, 1024, false));
+        test_cases.emplace_back(new test_mul_mat_glu(GGML_TYPE_Q4_0, 640, n, 2048, true));
+    }
 
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {

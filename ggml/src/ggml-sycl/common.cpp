@@ -149,6 +149,9 @@ static void * ggml_sycl_malloc_device_impl(size_t size, sycl::queue &q, ggml_syc
     return ptr;
 }
 
+bool (*g_ggml_sycl_low_mem_hook)(int device) = nullptr;
+void (*g_ggml_sycl_free_hook)(int device, const void * ptr, size_t size) = nullptr;
+
 // caller holds g_ggml_sycl_dev_alloc_mutex
 static bool ggml_sycl_free_mem_enough(int device, size_t size, ggml_sycl_mem_type type) {
     const size_t allocated = g_ggml_sycl_dev_alloc_bytes[device];
@@ -196,8 +199,11 @@ void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type t
 
     std::lock_guard<std::mutex> lock(g_ggml_sycl_dev_alloc_mutex);
     if (!ggml_sycl_free_mem_enough(device, size, type)) {
-        ggml_sycl_memtrace_fail(type, size);
-        return nullptr;
+        // memory that is only kept to save time (see g_ggml_sycl_low_mem_hook) is given back before the allocation fails
+        if (!(g_ggml_sycl_low_mem_hook && g_ggml_sycl_low_mem_hook(device) && ggml_sycl_free_mem_enough(device, size, type))) {
+            ggml_sycl_memtrace_fail(type, size);
+            return nullptr;
+        }
     }
 
     void * ptr = ggml_sycl_malloc_device_impl(size, q, type);
@@ -214,6 +220,9 @@ void ggml_sycl_free_device(void *ptr, sycl::queue &q) {
         auto it = g_ggml_sycl_dev_allocs.find(ptr);
         if (it != g_ggml_sycl_dev_allocs.end()) {
             const int device = it->second.first;
+            if (g_ggml_sycl_free_hook) {
+                g_ggml_sycl_free_hook(device, ptr, it->second.second);
+            }
             g_ggml_sycl_dev_alloc_bytes[device] -= it->second.second;
             if (g_ggml_sycl_dev_alloc_bytes[device] == 0) {
                 g_ggml_sycl_dev_free_baseline[device] = 0;
