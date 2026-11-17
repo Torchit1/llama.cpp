@@ -1019,6 +1019,63 @@ template <bool SR> struct xmx_traits_q8_0 : xmx_traits_base<SR, 16, xmx_scale_ki
     static ESIMD_INLINE simd<uint32_t, 128> unpack(const part_t & p, int g, int /*part*/) { return p.q[g]; }
 };
 
+// Q4_0 reorder layout: [qs: nrows*K/2 bytes] [d: one half per 32 weights]
+// group j of 32: the low nibbles of qs bytes 16*j..16*j+15 are weights 0..15, the high nibbles weights 16..31,
+// value is d * (q - 8), a group is one block with one scale
+template <bool SR> struct xmx_traits_q4_0 : xmx_traits_base<SR, 16, xmx_scale_kind::plain> {
+    struct ctx : xmx_ctx_base {
+        const uint8_t *    qs;
+        const sycl::half * dh;
+        unsigned           pq;
+    };
+
+    static ESIMD_INLINE ctx make(const void * vx, int nrows, int bpr, int row0) {
+        ctx c;
+        xmx_ctx_init(c, nrows, bpr, row0);
+        c.qs = (const uint8_t *) vx;
+        c.dh = (const sycl::half *) (c.qs + (size_t) nrows * bpr * (QK_K / 2));
+        c.pq = xmx_pitch(bpr, QK_K / 2);
+        return c;
+    }
+
+    struct scales_t {
+        xmx_row_scales<8> d;  // scale of each of the 8 blocks of a super-block
+    };
+
+    static ESIMD_INLINE scales_t load_scales(const ctx & c, int sb, const simd<uint32_t, 16> & rows) {
+        using namespace sycl::ext::intel::esimd;
+        scales_t           s;
+        simd<uint32_t, 16> blk = (rows * c.bpr + sb) * (QK_K / QK4_0);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            s.d.v[j] = convert<float>(gather<sycl::half, 16>(c.dh, (blk + j) * (uint32_t) sizeof(sycl::half)));
+        }
+        return s;
+    }
+
+    struct part_t {
+        simd<uint32_t, 128> q[2];  // the nibbles of two groups each
+    };
+
+    static ESIMD_INLINE part_t load_part(const ctx & c, int sb, int part) {
+        part_t p;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            p.q[h] = xmx_load_t<8, SR>(c.qs, c.pq, c.h, sb * 32 + 8 * (2 * part + h), c.row0);
+        }
+        return p;
+    }
+
+    static ESIMD_INLINE simd<uint32_t, 128> unpack(const part_t & p, int g, int /*part*/) {
+        simd<uint32_t, 128> q = p.q[g / 2];
+        simd<uint32_t, 64>  v = q.template select<64, 1>((g & 1) * 64);
+        simd<uint32_t, 128> x;
+        x.template select<64, 1>(0)  = v & 0x0F0F0F0Fu;
+        x.template select<64, 1>(64) = (v >> 4) & 0x0F0F0F0Fu;
+        return xmx_bytes_sub(x, 0x08080808u);
+    }
+};
+
 template <bool SR> using xmx_traits_q4_k = xmx_traits_q45_k<false, SR>;
 template <bool SR> using xmx_traits_q5_k = xmx_traits_q45_k<true, SR>;
 
