@@ -74,6 +74,8 @@ extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_mmvq_wide;
 extern int g_ggml_sycl_enable_xmx_esimd;
 extern int g_ggml_sycl_xmx_max_cols;
+// GGML_SYCL_XMX_Q4_0: 0 keeps Q4_0 weights off the XMX mul_mat_vec_q kernels
+extern int g_ggml_sycl_xmx_q4_0;
 extern int g_ggml_sycl_xmx_glu_max_cols;
 extern int g_ggml_sycl_prioritize_dmmv;
 
@@ -250,6 +252,8 @@ typedef sycl::float2 dfloat2;
 
 static inline bool ggml_sycl_xmx_supports_type(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q4_0:
+            return g_ggml_sycl_xmx_q4_0 != 0;
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
