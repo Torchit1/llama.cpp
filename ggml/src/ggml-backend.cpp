@@ -905,6 +905,15 @@ void ggml_backend_tensor_copy_n(const struct ggml_tensor * const * srcs, struct 
     }
 }
 
+bool ggml_backend_tensor_copy_rows_async(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst,
+                                         const int32_t * src_rows, const int32_t * dst_rows, int32_t n_rows, size_t row_bytes) {
+    GGML_ASSERT(backend);
+    if (n_rows <= 0) {
+        return true;
+    }
+    return backend->iface.cpy_rows_async != NULL && backend->iface.cpy_rows_async(backend, src, dst, src_rows, dst_rows, n_rows, row_bytes);
+}
+
 void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 

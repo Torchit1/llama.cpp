@@ -1,3 +1,5 @@
+#include <unordered_map>
+#include <vector>
 #include "fattn.hpp"
 #include "fattn-sparse.hpp"
 #include "dmmv.hpp"
@@ -540,7 +542,47 @@ static bool fa_rows_gather(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     return true;
 }
 
+// local probe (GGML_SYCL_FA_ROWS_STAT=1): how many distinct rows a call lists, how many of them the previous call on the
+// same cache listed too, and how many lie in the newest 32,768 cells
+static void fa_rows_stat(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
+    static const bool on = getenv("GGML_SYCL_FA_ROWS_STAT") != nullptr;
+    if (!on) {
+        return;
+    }
+    const ggml_tensor * k = dst->src[1], * rows = dst->src[5];
+    static std::unordered_map<const void *, std::vector<uint8_t>> prev;
+    std::vector<int32_t> r((size_t) rows->ne[0] * rows->ne[1]);
+    ctx.stream()->wait();
+    ctx.stream()->memcpy(r.data(), rows->data, r.size() * sizeof(int32_t)).wait();
+    int32_t top = -1;
+    for (int32_t v : r) {
+        top = std::max(top, v);
+    }
+    std::vector<uint8_t> seen((size_t) top + 1, 0);
+    std::vector<uint8_t> & before = prev[k->data];
+    size_t n_uniq = 0, n_again = 0, n_recent = 0, n_live = 0, n_old_new = 0;
+    for (int32_t v : r) {
+        if (v < 0) {
+            continue;
+        }
+        n_live++;
+        if (!seen[v]) {
+            seen[v] = 1;
+            n_uniq++;
+            const bool again  = (size_t) v < before.size() && before[v];
+            const bool recent = v > top - 32768;
+            n_again  += again;
+            n_recent += recent;
+            n_old_new += !again && !recent;
+        }
+    }
+    fprintf(stderr, "FAROWS slices=%lld cols=%lld top_cell=%d live=%zu distinct=%zu also_in_previous_call=%zu in_newest_32k=%zu old_and_new_to_the_card=%zu\n",
+            (long long) rows->ne[1], (long long) rows->ne[0], top, n_live, n_uniq, n_again, n_recent, n_old_new);
+    before.swap(seen);
+}
+
 void ggml_sycl_flash_attn_ext_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    fa_rows_stat(ctx, dst);
     // GGML_SYCL_FA_ROWS_GATHER=0: the single-kernel versions below
     static const bool gather_on = getenv("GGML_SYCL_FA_ROWS_GATHER") == nullptr || atoi(getenv("GGML_SYCL_FA_ROWS_GATHER")) != 0;
     if (gather_on && fa_rows_gather(ctx, dst)) {

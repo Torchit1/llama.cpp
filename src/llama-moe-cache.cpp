@@ -1119,6 +1119,39 @@ struct llama_moe_cache::impl {
         return n;
     }
 
+    // LLAMA_MOE_COPY_BATCHED=0 turns it off
+    int64_t copy_experts_batched(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, std::vector<bool> & used) {
+        static const bool on = getenv("LLAMA_MOE_COPY_BATCHED") == nullptr || atoi(getenv("LLAMA_MOE_COPY_BATCHED")) != 0;
+        const auto it = bindings.find(w);
+        if (!on || it == bindings.end()) {
+            return 0;
+        }
+        const binding & b = it->second;
+        const group & g = groups[layers[b.il].ig];
+        const int32_t * slots = g.lru.slot_map[b.il];
+        if (backend != devices[g.id].backend || slots == nullptr) {
+            return 0;
+        }
+        std::vector<int32_t> src_rows;
+        std::vector<int32_t> dst_rows;
+        for (size_t e = 0; e < used.size(); ++e) {
+            if (used[e] && slots[e] < g.n_slots) {
+                src_rows.push_back(slots[e]);
+                dst_rows.push_back((int32_t) e);
+            }
+        }
+        ggml_tensor * bank = g.banks[b.ip];
+        if (src_rows.empty() || !ggml_backend_tensor_copy_rows_async(backend, bank, dst, src_rows.data(), dst_rows.data(), (int32_t) src_rows.size(), w->nb[2])) {
+            return 0;
+        }
+        for (int32_t e : dst_rows) {
+            used[e] = false;
+        }
+        stats_copy.hits  += src_rows.size();
+        stats_copy.bytes += src_rows.size()*w->nb[2];
+        return (int64_t) src_rows.size();
+    }
+
     struct read_job { const uint8_t * src; uint8_t * dst; size_t size; };
 
     // read experts from the file into pinned memory with helper threads, one request per expert tensor
@@ -1687,6 +1720,10 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+int64_t llama_moe_cache::copy_experts_batched(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, std::vector<bool> & used) {
+    return pimpl->copy_experts_batched(backend, w, dst, used);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

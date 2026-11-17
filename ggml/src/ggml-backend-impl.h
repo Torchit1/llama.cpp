@@ -162,6 +162,11 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) copy n_rows blocks of row_bytes between two tensors of this backend in one go: block src_rows[i] of src
+        // to block dst_rows[i] of dst (offsets in units of row_bytes from the tensors' data). Returns false if not taken.
+        bool (*cpy_rows_async)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, const int32_t * src_rows,
+                               const int32_t * dst_rows, int32_t n_rows, size_t row_bytes);
     };
 
     struct ggml_backend {

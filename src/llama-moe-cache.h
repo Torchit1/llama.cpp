@@ -46,6 +46,10 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
+    // Copies every expert of w that is used and in the device cache to its place in dst with one backend call, and clears
+    // its entry in used. Returns the number copied, 0 if the backend has no such copy (copy_experts() then does them).
+    int64_t copy_experts_batched(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, std::vector<bool> & used);
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     // local: running totals for the scope timeline: slot hits, misses, RAM tier hits, file reads, bytes read, bytes uploaded

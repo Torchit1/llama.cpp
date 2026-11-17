@@ -119,6 +119,10 @@ extern "C" {
     // backend_dst will wait for the copy to complete before performing other operations
     // automatic fallback to sync copy if async is not supported
     GGML_API void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+    // Copies n_rows blocks of row_bytes between two tensors of one backend in one go: block src_rows[i] of src to block
+    // dst_rows[i] of dst. Returns false if the backend has no such copy; the caller then copies block by block.
+    GGML_API bool ggml_backend_tensor_copy_rows_async(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst,
+                                                      const int32_t * src_rows, const int32_t * dst_rows, int32_t n_rows, size_t row_bytes);
 
     GGML_API ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend);
 

@@ -7996,6 +7996,41 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 }
 
+// one kernel copies every block: the row lists go to the device through pinned memory, like other small uploads
+static bool ggml_backend_sycl_cpy_rows_async(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const int32_t * src_rows,
+                                             const int32_t * dst_rows, int32_t n_rows, size_t row_bytes) try {
+    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (buf_src->buft != ggml_backend_sycl_buffer_type(sycl_ctx->device) || buf_dst->buft != buf_src->buft || row_bytes % 4 != 0 ||
+        (uintptr_t) src->data % 4 != 0 || (uintptr_t) dst->data % 4 != 0) {
+        return false;
+    }
+    const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    const size_t idx_bytes = (size_t) 2 * n_rows * sizeof(int32_t);
+    uint8_t * pinned = g_ggml_sycl_pin_rings[sycl_ctx->device].take(*stream, idx_bytes);
+    if (pinned == nullptr) {
+        return false;
+    }
+    memcpy(pinned, src_rows, idx_bytes / 2);
+    memcpy(pinned + idx_bytes / 2, dst_rows, idx_bytes / 2);
+    ggml_sycl_pool_alloc<int32_t> idx(sycl_ctx->pool(), (size_t) 2 * n_rows);
+    int32_t * idx_p = idx.get();
+    stream->memcpy(idx_p, pinned, idx_bytes);
+    const uint32_t * s = (const uint32_t *) src->data;
+    uint32_t *       d = (uint32_t *) dst->data;
+    const size_t     n_words = row_bytes / 4;
+    stream->parallel_for(sycl::range<2>((size_t) n_rows, n_words), [=](sycl::id<2> i) {
+        d[(size_t) idx_p[n_rows + i[0]] * n_words + i[1]] = s[(size_t) idx_p[i[0]] * n_words + i[1]];
+    });
+    return true;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
 static ggml_backend_i ggml_backend_sycl_interface = {
     /* .get_name                = */ ggml_backend_sycl_get_name,
     /* .free                    = */ ggml_backend_sycl_free,
@@ -8015,6 +8050,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .event_record            = */ ggml_backend_sycl_event_record,
     /* .event_wait              = */ ggml_backend_sycl_event_wait,
     /* .graph_optimize          = */ ggml_backend_sycl_graph_optimize,
+    /* .cpy_rows_async          = */ ggml_backend_sycl_cpy_rows_async,
 };
 
 static ggml_guid_t ggml_backend_sycl_guid() {

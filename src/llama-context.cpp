@@ -3315,14 +3315,33 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    // local probe (LLAMA_MOE_COPY_TRACE=1): what one layer tensor of a large batch costs to assemble on the device
+    static const bool copy_trace = getenv("LLAMA_MOE_COPY_TRACE") != nullptr;
+    int64_t tr_t0 = 0, tr_dev = 0, tr_dev_n = 0, tr_up = 0, tr_used = 0;
+    if (copy_trace) {
+        ggml_backend_synchronize(backend);
+        tr_t0 = ggml_time_us();
+        for (int64_t e = 0; e < n_expert; ++e) {
+            tr_used += st.used[e];
+        }
+    }
+
+    // the experts in the MoE cache go over in one device copy where the backend has one; rest holds what is left
+    std::vector<bool> rest = st.used;
+    if (lctx->moe_cache) {
+        const int64_t n_batched = lctx->moe_cache->copy_experts_batched(backend, src, dst, rest);
+        tr_dev   += n_batched;
+        tr_dev_n += n_batched > 0;
+    }
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
-        if (!st.used[first]) {
+        if (!rest[first]) {
             first++;
             continue;
         }
         int64_t last = first;
-        while (last + 1 < n_expert && st.used[last + 1]) {
+        while (last + 1 < n_expert && rest[last + 1]) {
             last++;
         }
 
@@ -3337,19 +3356,31 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             if (next < e && !lctx->moe_cache->upload_file_backed(backend, src, dst, next*expert_size, (e - next)*expert_size)) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
             }
+            tr_up    += e - next;
+            tr_dev   += n;
+            tr_dev_n += 1;
             e   += n;
             next = e;
         }
 
         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
         const size_t offset  = next*expert_size;
-        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+        // (not into an expert the batched copy has placed: the padding would overwrite its start)
+        const size_t padding = last < n_expert - 1 && !st.used[last + 1] ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0 && !(lctx->moe_cache && lctx->moe_cache->upload_file_backed(backend, src, dst, offset, size))) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
         }
+        tr_up += last + 1 - next;
 
         first = last + 1;
+    }
+
+    if (copy_trace) {
+        ggml_backend_synchronize(backend);
+        fprintf(stderr, "MOECOPY tokens=%lld used=%lld from_device=%lld in_copies=%lld uploaded=%lld expert_kib=%zu ms=%.2f\n",
+                (long long) ids->ne[1], (long long) tr_used, (long long) tr_dev, (long long) tr_dev_n, (long long) tr_up, expert_size/1024,
+                (ggml_time_us() - tr_t0)/1000.0);
     }
 
     return true;
