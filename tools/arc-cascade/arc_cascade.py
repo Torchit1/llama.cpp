@@ -20,6 +20,7 @@ CARDS = {'B70': 32656, 'B580': 12216}          # usable MiB as the driver report
 SERVER_RAM_MIB = 3500                         # host memory the server uses beyond the pinned RAM tier
 # context: 32 MiB of VRAM per 1,024 tokens, working memory that grows with it included (Flash-Next at 262K, 16 Nov 2026)
 HOST_KEEP_MIB = 8000                          # host memory never given to the pinned RAM tier
+IDLE_USED_MIB = 300                           # what a card with nothing running shows as used (B70: 32656 total, 32369 free)
 RESERVE_MIB = 600                             # per card, left free
 TWO_CARD_MARGIN_MIB = 4000                    # extra room when the cache is split over cards (one run so far, at 32000)
 WIDE_PASS_MIB = 700                           # working memory of a wide (up to 128-token) checking pass
@@ -75,7 +76,18 @@ def plan(a):
     m = sizes(a.model); h = sizes(a.head) if a.head else None
     head_w = (h['exps'] + h['other']) if h else 0
     cards = [c.strip() for c in a.cards.split(',') if c.strip()]
-    vram = [int(v) for v in a.vram_mib.split(',')] if a.vram_mib else [CARDS[c] for c in cards]
+    vram = [int(v) for v in a.vram_mib.split(',')] if a.vram_mib else [card_vram(c, a.bin) for c in cards]
+    # A card that something else is using (a display, a media server) has less to give than its total: plan with what is
+    # free now plus the ~300 MiB an idle card shows as used anyway (18 Nov: a B580 with 2.3 GB taken by another program
+    # failed to start a plan made for all 12 GB).
+    in_use_notes = []
+    if not a.vram_mib:
+        for k, c in enumerate(cards):
+            free_now = card_free(c, a.bin)
+            if free_now is not None and free_now + IDLE_USED_MIB < vram[k]:
+                in_use_notes.append('%s: %d MiB already in use by something else, planning with %d MiB' % (
+                    c, vram[k] - free_now, free_now + IDLE_USED_MIB))
+                vram[k] = free_now + IDLE_USED_MIB
     assert len(vram) == len(cards), '--vram-mib needs one value per card'
     free = free_ram_mib()
     # The tier is pinned memory, which the host cannot take back: a budget that used all the free RAM froze the machine
@@ -87,6 +99,7 @@ def plan(a):
     out = {'lines': [], 'env': {}, 'args': ['-m', a.model, '-fa', 'on', '-c', str(a.ctx)], 'cards': cards[:1], 'ok': True}
     L = out['lines'].append
     if cut_note: L(cut_note)
+    for n in in_use_notes: L(n)
     L('model: %.0f MiB of experts, %.0f MiB of other weights%s%s' % (m['exps'], m['other'],
         ', %.0f MiB on-disk table' % m['lazy'] if m['lazy'] else '', '; draft head %.0f MiB' % head_w if h else ''))
     L('cards: %s; RAM free now %d MiB, budget %d MiB' % (', '.join('%s %d MiB' % cv for cv in zip(cards, vram)), free, ram_budget))
@@ -138,9 +151,17 @@ def plan(a):
         return out
     # 3. tiers
     if m['exps'] < 0.5 * (m['exps'] + m['other']):
-        out['ok'] = False
-        L('REFUSED: the model needs %.0f MiB and only %.0f MiB of it is experts. The tiers hold experts only, so a mostly dense '
-          'model this size cannot be placed. Use a smaller quant.' % (whole, m['exps']))
+        # A mostly dense model: the tiers hold experts only, so llama.cpp's own fitting (--fit, on by default) decides how
+        # many layers go on the card and the rest run on the CPU. Much slower per token: Qwen3.8-27B Q4_0 with 36 of 64
+        # layers on a B580 decoded at 3.2 t/s (18 Nov).
+        use = cards if len(cards) > 1 else cards[:1]
+        L('plan: dense model, %.0f MiB, does not fit %s (%d MiB): llama.cpp places as many layers as fit on the card and '
+          'runs the rest on the CPU. Expect a few tokens a second; a smaller quant that fits the card is much faster.' % (
+            whole, ' + '.join(use), sum(vram[:len(use)])))
+        out['cards'] = use
+        # 3 GB stay free on each card: with fit's default 1 GB a B580 that something else was also using (2.3 GB) ran out
+        # mid-start and the device was lost (18 Nov); with 3 GB it started and answered (2.3 t/s).
+        out['args'] += ['-fit', 'on', '-fitt', '3000']
         return out
     use = cards if len(cards) > 1 else cards[:1]
     total = sum(vram[:len(use)])
@@ -179,6 +200,42 @@ def plan(a):
         L('  start: the expert cache and the RAM tier are filled from the file before the first request (--no-preload fills them as experts are used)')
     out['args'] += ['-ngl', '99', '-lm', 'none', '-lzm', 'on', '-cmoe', '--moe-cache-mib', str(cache), '-b', str(ub), '-ub', str(ub)]
     return out
+
+_devices = None
+def card_vram(name, bin_dir):
+    """Usable MiB of a card: the table above, else what llama-server --list-devices reports for the first device whose
+    name contains `name` (any Intel GPU the SYCL backend sees, e.g. --cards A770 or --cards B60)."""
+    global _devices
+    if name in CARDS: return CARDS[name]
+    return _find_device(name, bin_dir)[1]
+
+def card_free(name, bin_dir):
+    """MiB free on the card now, as llama-server reports it; None if it cannot be read."""
+    try: return _find_device(name, bin_dir)[2]
+    except SystemExit: return None
+
+def _find_device(name, bin_dir):
+    global _devices
+    if _devices is None:
+        exe = os.path.join(bin_dir, 'llama-server')
+        env = dict(os.environ, ONEAPI_DEVICE_SELECTOR='level_zero:*', SYCL_UR_USE_LEVEL_ZERO_V2='0')
+        try:
+            txt = subprocess.run([exe, '--list-devices'], env=env, capture_output=True, text=True, timeout=120).stdout
+        except Exception as e:
+            sys.exit('card %s is not in the table and llama-server --list-devices failed (%s): give --vram-mib' % (name, e))
+        _devices = []
+        for l in txt.splitlines():
+            l = l.strip()
+            if l.startswith('SYCL') and '(' in l and 'MiB' in l:
+                # "SYCL0: Intel(R) Arc(TM) Pro B70 Graphics (32656 MiB, 32369 MiB free)"
+                try:
+                    nums = l.rsplit('(', 1)[1].replace(',', ' ').split()
+                    _devices.append((l.split(':', 1)[1].rsplit('(', 1)[0].strip(), int(nums[0]), int(nums[2]) if len(nums) > 2 and nums[2].isdigit() else None))
+                except (ValueError, IndexError): pass
+    for d in _devices:
+        if name.lower() in d[0].lower(): return d
+    sys.exit('card %s not found; llama-server sees: %s. Use a part of one of these names, or give --vram-mib' % (
+        name, '; '.join('%s (%d MiB)' % d[:2] for d in _devices) or 'no SYCL devices'))
 
 def card_selector(cards):
     """level_zero indices of the named cards, from sycl-ls (same rule as the job runner's card())."""
