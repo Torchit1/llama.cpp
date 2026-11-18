@@ -171,6 +171,13 @@ def plan(a):
         cache = total - fixed(ub) - margin
         if cache >= 3000:
             choice = (ub, cache); break
+    # Prompt batches of 4,096 when that keeps at least 90% of the expert cache: 122B on a B70 (19 Nov) read a 15K prompt
+    # at 849 t/s against 533 with 1,024 and generated the same once warm (34.1 against 34.3); the first answer after a
+    # long prompt was about 20% slower. Smaller cards lose a bigger share of their cache and keep 1,024 (not measured).
+    if choice and not a.prompt_batch and choice[0] == 1024:
+        big = total - fixed(4096) - margin
+        if big >= 0.9 * choice[1]:
+            choice = (4096, big)
     if not choice:
         out['ok'] = False
         L('REFUSED: after the non-expert weights and working memory (%.0f MiB) there is no room for an expert cache on %s.' % (fixed(256), ' + '.join(use)))
