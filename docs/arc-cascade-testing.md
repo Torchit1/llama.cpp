@@ -59,7 +59,11 @@ at a time, and the `Level Zero v2` adapter.
 - `--cards`: names from the table at the top of the script (B70, B580). For another card give its usable VRAM with
   `--vram-mib`, one value per card.
 - `--ram-mib`: the most RAM the server may use. The pinned tier is this minus about 3.5 GB. Without it the budget is
-  the free RAM minus 5 GB.
+  the free RAM minus 8 GB, and 8 GB always stay free whatever `--ram-mib` asks for.
+- `--fast-prompt` / `--no-fast-prompt`: when the model fits one card and most of its weights are dense Q4_0, the
+  launcher turns on the 8-bit prompt path (`GGML_SYCL_Q4_0_ROT8=1`) with prompt chunks of 4,096 tokens, if that
+  chunk's working memory still fits. Qwen3.8-27B Q4_0 on a B70: 1,347 -> 1,889 t/s on a 19K prompt. These switch
+  it on or off whatever the launcher decides.
 - `--head HEAD.gguf`: a multi-token draft head for the model, if one exists.
 - `--remember`: on shutdown the server writes which experts were in VRAM and RAM, and loads them back at the next
   start. Off by default. Output is unchanged. 122B on both cards: the first answer after a start runs at 37.6 t/s

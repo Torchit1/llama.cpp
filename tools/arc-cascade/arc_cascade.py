@@ -24,9 +24,10 @@ RESERVE_MIB = 600                             # per card, left free
 TWO_CARD_MARGIN_MIB = 4000                    # extra room when the cache is split over cards (one run so far, at 32000)
 WIDE_PASS_MIB = 700                           # working memory of a wide (up to 128-token) checking pass
 MiB = 2 ** 20
+FAST_PROMPT_BATCH = 4096
 
 def gguf_tensors(path):
-    """(name, bytes) of every tensor, from the GGUF header alone: a tensor's size is the gap to the next offset."""
+    """(name, bytes, ggml type) of every tensor, from the GGUF header alone: a tensor's size is the gap to the next offset."""
     with open(path, 'rb') as f:
         def u32(): return struct.unpack('<I', f.read(4))[0]
         def u64(): return struct.unpack('<Q', f.read(8))[0]
@@ -49,19 +50,20 @@ def gguf_tensors(path):
             else: skip(t)
         infos = []
         for _ in range(n_tensors):
-            name = string(); nd = u32(); f.seek(8 * nd, 1); u32(); infos.append((name, u64()))
+            name = string(); nd = u32(); f.seek(8 * nd, 1); ty = u32(); infos.append((name, u64(), ty))
         data_start = (f.tell() + align - 1) // align * align
         size = os.path.getsize(path) - data_start
     infos.sort(key=lambda x: x[1])
-    return [(n, (infos[k + 1][1] if k + 1 < len(infos) else size) - o) for k, (n, o) in enumerate(infos)]
+    return [(n, (infos[k + 1][1] if k + 1 < len(infos) else size) - o, ty) for k, (n, o, ty) in enumerate(infos)]
 
 def sizes(path):
     files = sorted(glob.glob(path.replace('-00001-of-', '-*-of-'))) if '-00001-of-' in path else [path]
-    s = {'exps': 0, 'lazy': 0, 'other': 0}
+    s = {'exps': 0, 'lazy': 0, 'other': 0, 'q4_0': 0}
     for f in files:
-        for name, nbytes in gguf_tensors(f):
+        for name, nbytes, ty in gguf_tensors(f):
             k = 'exps' if '_exps.' in name else ('lazy' if 'per_layer_token_embd' in name else 'other')
             s[k] += nbytes
+            if ty == 2 and k == 'other': s['q4_0'] += nbytes   # ggml type 2 = Q4_0, dense weights only
     return {k: v / MiB for k, v in s.items()}
 
 def free_ram_mib():
@@ -79,10 +81,12 @@ def plan(a):
     # The tier is pinned memory, which the host cannot take back: a budget that used all the free RAM froze the machine
     # (17 Nov). HOST_KEEP_MIB always stays free, whatever --ram-mib asks for.
     ram_budget = max(0, min(a.ram_mib if a.ram_mib else free, free - HOST_KEEP_MIB))
+    cut_note = None
     if a.ram_mib and ram_budget < a.ram_mib:
-        out['lines'].append('RAM budget cut from %d to %d MiB: %d MiB are free and %d stay free for the rest of the machine' % (a.ram_mib, ram_budget, free, HOST_KEEP_MIB))
+        cut_note = ('RAM budget cut from %d to %d MiB: %d MiB are free and %d stay free for the rest of the machine' % (a.ram_mib, ram_budget, free, HOST_KEEP_MIB))
     out = {'lines': [], 'env': {}, 'args': ['-m', a.model, '-fa', 'on', '-c', str(a.ctx)], 'cards': cards[:1], 'ok': True}
     L = out['lines'].append
+    if cut_note: L(cut_note)
     L('model: %.0f MiB of experts, %.0f MiB of other weights%s%s' % (m['exps'], m['other'],
         ', %.0f MiB on-disk table' % m['lazy'] if m['lazy'] else '', '; draft head %.0f MiB' % head_w if h else ''))
     L('cards: %s; RAM free now %d MiB, budget %d MiB' % (', '.join('%s %d MiB' % cv for cv in zip(cards, vram)), free, ram_budget))
@@ -112,6 +116,19 @@ def plan(a):
     if whole - one_card_less + RESERVE_MIB <= vram[0]:
         L('plan: everything on the %s (%.0f of %d MiB)' % (cards[0], whole, vram[0]))
         out['args'] += ['-ngl', '99', '-lm', 'dio']
+        # Fast prompt reading (18 Nov): a dense Q4_0 model reads prompts through 8-bit matmuls in chunks of 4,096 tokens
+        # (27B on a B70: 1,347 -> 1,889 t/s on a 19K prompt). On when most of the weights are dense Q4_0 and the bigger
+        # chunk's working memory still fits; --fast-prompt / --no-fast-prompt decide otherwise.
+        q4_share = m['q4_0'] / max(1.0, m['exps'] + m['other'])
+        fits = m['exps'] + fixed(FAST_PROMPT_BATCH) - one_card_less + RESERVE_MIB <= vram[0]
+        fast = a.fast_prompt if a.fast_prompt is not None else (q4_share >= 0.5 and fits)
+        if fast:
+            out['env']['GGML_SYCL_Q4_0_ROT8'] = '1'
+            out['args'] += ['-b', str(FAST_PROMPT_BATCH), '-ub', str(FAST_PROMPT_BATCH)]
+            L('fast prompt reading: on (%.0f%% of the weights are dense Q4_0; prompt chunks of %d tokens)' % (100 * q4_share, FAST_PROMPT_BATCH))
+        elif q4_share >= 0.5:
+            L('fast prompt reading: off (%s)' % ('--no-fast-prompt' if a.fast_prompt is False else
+                'the %d-token chunk does not fit next to everything else' % FAST_PROMPT_BATCH))
         return out
     # 2. all of it across the cards
     if len(cards) > 1 and whole + RESERVE_MIB * len(cards) + TWO_CARD_MARGIN_MIB <= sum(vram):
@@ -187,6 +204,8 @@ ap.add_argument('--remember', action='store_true'); ap.add_argument('--usage-fil
 ap.add_argument('--copy-drafts', action=argparse.BooleanOptionalAction, default=None)
 # attention cache precision: 8 keeps about 30% more context per MiB, the answers differ slightly from 16
 ap.add_argument('--cache-bits', type=int, choices=[8, 16], default=16)
+# one card, dense Q4_0 models: 8-bit prompt matmuls in chunks of 4,096 tokens (default: on when it applies and fits)
+ap.add_argument('--fast-prompt', action=argparse.BooleanOptionalAction, default=None)
 # tiers only: prompt batch (default: the largest of 1024 / 512 / 256 that leaves room for an expert cache)
 ap.add_argument('--prompt-batch', type=int)
 # tiers only: fill the expert cache and the RAM tier at start, so no expert is read from the file mid-answer
