@@ -687,6 +687,104 @@ static inline void keep(ggml_backend_sycl_context & ctx, const void * key, const
     st.resident_other += (size_t) N * K;
 }
 
+// f16 weights [N][K] (row major): the same rotation as weights() for Q4_0, value i * SG + lane of a block in reg[i].
+// out == nullptr: the largest rotated value of each block to bmax; else int8 with the row scales in the matmul's layout.
+static inline void weights_f16(const sycl::half * w16, const int N, const int K, float * bmax, const float * rscale, int8_t * out,
+                               dpct::queue_ptr stream) {
+    const int   nblk = K / BL;
+    const bool  rm   = row_major();
+    const float wl   = 127.0f;
+    stream->parallel_for(sycl::nd_range<2>({ (size_t) N * nblk, SG }, { 4, SG }),
+                         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const auto   sg   = it.get_sub_group();
+        const int    lane = sg.get_local_linear_id();
+        const size_t id   = it.get_global_id(0);
+        const int    r    = (int) (id / nblk);
+        const int    b    = (int) (id % nblk);
+        const sycl::half * p = w16 + (size_t) r * K + (size_t) b * BL;
+        float reg[EW];
+#pragma unroll
+        for (int i = 0; i < EW; ++i) {
+            reg[i] = (float) p[i * SG + lane];
+        }
+        fwht(reg, sg, lane);
+        if (out == nullptr) {
+            float m = 0.0f;
+#pragma unroll
+            for (int i = 0; i < EW; ++i) {
+                m = sycl::fmax(m, sycl::fabs(reg[i]));
+            }
+            m = sycl::reduce_over_group(sg, m, sycl::maximum<float>());
+            if (lane == 0) {
+                bmax[id] = m;
+            }
+        } else {
+            const float s = rscale[r];
+            if (rm) {
+                int8_t * o = out + (size_t) r * K + (size_t) b * BL;
+#pragma unroll
+                for (int i = 0; i < EW; ++i) {
+                    o[i * SG + lane] = (int8_t) sycl::clamp(sycl::rint(reg[i] * s), -wl, wl);
+                }
+            } else {
+                int8_t * o = out + (size_t) b * BL * N + r;
+#pragma unroll
+                for (int i = 0; i < EW; ++i) {
+                    o[(size_t) (i * SG + lane) * N] = (int8_t) sycl::clamp(sycl::rint(reg[i] * s), -wl, wl);
+                }
+            }
+        }
+    });
+}
+
+// Weights of the other types that are not kept (no room for their int8 copy, e.g. a 27B whose copy would be ~27 GB):
+// converted every pass from the f16 values the caller made into the shared scratch, as Q4_0 is. Costs a read of the f16
+// weights and a write of the int8 ones per pass; the row scales are worked out once per tensor.
+// GGML_SYCL_ROT8_TRANSIENT=0 turns this off (those weights then take the caller's other path).
+static inline bool transient_on() {
+    static const bool on = env_mib("GGML_SYCL_ROT8_TRANSIENT", 1) != 0;
+    return on;
+}
+
+static inline bool mul_mat_f16(ggml_backend_sycl_context & ctx, const void * key, const sycl::half * w16, const float * x,
+                               const ggml_tensor * x_id, float * dst, const int M, const int K, const int N, dpct::queue_ptr stream) {
+    if (!transient_on() || K % BL != 0 || !shape_ok(M, K, N)) {
+        return false;
+    }
+    device_state & st = state(ggml_sycl_get_device());
+    tensor_state & ts = st.tensors[key];
+    if (ts.w8 != nullptr) {
+        return run(ctx, st, ts, ts.w8, x, x_id, dst, M, K, N, stream);
+    }
+    if (ts.to == nullptr) {
+        const int nblk = K / BL;
+        ts.to   = sycl::malloc_device<float>(N, *stream);
+        ts.back = sycl::malloc_device<float>(N, *stream);
+        if (ts.to == nullptr || ts.back == nullptr) {
+            return false;
+        }
+        ggml_sycl_pool_alloc<float> bmax(ctx.pool(), (size_t) N * nblk);
+        weights_f16(w16, N, K, bmax.get(), nullptr, nullptr, stream);
+        row_scales(bmax.get(), N, nblk, ts.to, ts.back, 1.0f / BL, 127.0f, 1.0f, stream);
+        stream->wait();
+        g_ggml_sycl_low_mem_hook = release_kept;
+        g_ggml_sycl_free_hook    = forget_range;
+    }
+    if (st.stage_size < (size_t) N * K) {
+        stream->wait();
+        if (st.stage != nullptr) {
+            sycl::free(st.stage, *stream);
+        }
+        st.stage      = (int8_t *) sycl::aligned_alloc_device(4096, (size_t) N * K, *stream);
+        st.stage_size = st.stage != nullptr ? (size_t) N * K : 0;
+        if (st.stage == nullptr) {
+            return false;
+        }
+    }
+    weights_f16(w16, N, K, nullptr, ts.to, st.stage, stream);
+    return run(ctx, st, ts, st.stage, x, x_id, dst, M, K, N, stream);
+}
+
 static inline bool mul_mat_kept(ggml_backend_sycl_context & ctx, const void * key, const float * x, const ggml_tensor * x_id, float * dst,
                                 const int M, const int K, const int N, dpct::queue_ptr stream) {
     device_state & st = state(ggml_sycl_get_device());

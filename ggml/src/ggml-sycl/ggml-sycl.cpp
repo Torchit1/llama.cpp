@@ -3347,6 +3347,18 @@ inline void ggml_sycl_op_mul_mat_sycl(
         if (ggml_sycl_rot8::mul_mat_kept(ctx, src0_dd_i, src1_ddf_i, src1, dst_dd_i, (int) src1_ncols, (int) ne00, (int) row_diff, stream)) {
             return;
         }
+        // not kept (no room for its int8 copy): convert it this pass, as Q4_0 is (rot8.hpp mul_mat_f16)
+        if (ggml_sycl_rot8::transient_on() && ne00 % 1024 == 0) {
+            const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst);
+            if (to_fp16_sycl != nullptr) {
+                ggml_sycl_pool_alloc<sycl::half> w16(ctx.pool(), (size_t) row_diff * ne00);
+                to_fp16_sycl(src0_dd_i, w16.get(), row_diff * ne00, stream);
+                if (ggml_sycl_rot8::mul_mat_f16(ctx, src0_dd_i, w16.get(), src1_ddf_i, src1, dst_dd_i, (int) src1_ncols, (int) ne00,
+                                                (int) row_diff, stream)) {
+                    return;
+                }
+            }
+        }
     }
 #endif
 
