@@ -270,6 +270,8 @@ ap.add_argument('--copy-drafts', action=argparse.BooleanOptionalAction, default=
 ap.add_argument('--cache-bits', type=int, choices=[8, 16], default=16)
 # one card, dense Q4_0 models: 8-bit prompt matmuls in chunks of 4,096 tokens (default: on when it applies and fits)
 ap.add_argument('--fast-prompt', action=argparse.BooleanOptionalAction, default=None)
+# keep --head even when the model needs tiers (by default the head is dropped there: it costs expert-cache room)
+ap.add_argument('--keep-head', action='store_true')
 # tiers only: prompt batch (default: the largest of 1024 / 512 / 256 that leaves room for an expert cache)
 ap.add_argument('--prompt-batch', type=int)
 # tiers only: fill the expert cache and the RAM tier at start, so no expert is read from the file mid-answer
@@ -281,6 +283,14 @@ if '--' in argv:
     cut = argv.index('--'); argv, extra = argv[:cut], argv[cut + 1:]
 a = ap.parse_args(argv)
 p = plan(a)
+# A draft head pays only when the whole model is on the cards. On tiers its weights take expert-cache room and checking
+# drafts calls more experts, so it lost on every tiered run (19 Nov, Q8_0 heads: 122B on a B70 code 30.4 -> 21.7 t/s,
+# 35B on a B580 24.0 -> 15.5; the same 35B head on a B70 with everything on the card: 111 -> 140). --keep-head keeps it.
+if a.head and not a.keep_head and p['ok'] and 'LLAMA_MOE_RAM_CACHE_MIB' in p['env']:
+    a.head = None
+    p = plan(a)
+    p['lines'].insert(0, 'draft head: dropped, the model needs the RAM/disk tiers and the head would take expert-cache room '
+                         '(it made tiered runs 30-35% slower); --keep-head keeps it')
 for l in p['lines']: print(l)
 if not p['ok']: sys.exit(2)
 args = p['args'] + ['-t', str(a.threads)] + extra
