@@ -354,7 +354,7 @@ static inline bool room_for(const int device, const size_t bytes) {
 }
 
 // the most Q4_0 weights kept: GGML_SYCL_ROT8_RESIDENT_MIB if set, else what is free at the first call less the reserve
-// and less GGML_SYCL_ROT8_OTHER_MIB (default 2400) for the weights of other types, which are only taken when kept
+// (and less GGML_SYCL_ROT8_OTHER_MIB when that is set)
 static inline size_t q4_budget(const int device) {
     static size_t budget[GGML_SYCL_MAX_DEVICES];
     static bool   known[GGML_SYCL_MAX_DEVICES];
@@ -362,7 +362,10 @@ static inline size_t q4_budget(const int device) {
         known[device] = true;
         size_t free_b = 0, total_b = 0;
         ggml_backend_sycl_get_device_memory(device, &free_b, &total_b);
-        const size_t keep_free = env_mib("GGML_SYCL_ROT8_RESERVE_MIB", 3000) + env_mib("GGML_SYCL_ROT8_OTHER_MIB", 2400);
+        // the reserve, plus GGML_SYCL_ROT8_OTHER_MIB set aside for other types only when it is set: by default every type keeps
+        // what really fits (each keep checks free memory, see room_for)
+        const size_t keep_free = env_mib("GGML_SYCL_ROT8_RESERVE_MIB", 3000) +
+                                 (std::getenv("GGML_SYCL_ROT8_OTHER_MIB") ? env_mib("GGML_SYCL_ROT8_OTHER_MIB", 0) : 0);
         const size_t fits      = free_b > keep_free ? free_b - keep_free : 0;
         budget[device]         = std::getenv("GGML_SYCL_ROT8_RESIDENT_MIB") ? std::min(fits, env_mib("GGML_SYCL_ROT8_RESIDENT_MIB", 0)) : fits;
         GGML_LOG_INFO("%s: %.0f MiB of the device free, up to %.0f MiB of converted Q4_0 weights are kept\n", __func__, free_b / 1048576.0,
@@ -648,13 +651,20 @@ static inline bool wanted(const void * key, const int K) {
 static inline void keep(ggml_backend_sycl_context & ctx, const void * key, const sycl::half * w16, const int K, const int N, dpct::queue_ptr stream) {
     device_state & st = state(ggml_sycl_get_device());
     tensor_state & ts = st.tensors[key];
-    static const size_t budget = env_mib("GGML_SYCL_ROT8_OTHER_MIB", 2400);
+    // default: no cap of its own, what really fits is kept (room_for below); GGML_SYCL_ROT8_OTHER_MIB caps it
+    static const size_t budget = std::getenv("GGML_SYCL_ROT8_OTHER_MIB") ? env_mib("GGML_SYCL_ROT8_OTHER_MIB", 0) : SIZE_MAX;
     ts.declined = true;
     // (the conversion needs two f32 copies of the weights for a moment)
     // (their room was set aside when the Q4_0 budget was fixed, see q4_budget)
     g_ggml_sycl_low_mem_hook = release_kept;
     g_ggml_sycl_free_hook    = forget_range;
     if (K % BL != 0 || !shape_ok(4, K, N) || st.keep_off || st.resident_other + (size_t) N * K > budget) {
+        return;
+    }
+    // only in memory that is really free: the int8 copy (1 byte a weight) plus the conversion's two f32 scratch copies
+    // (8 bytes a weight, released right after), with GGML_SYCL_ROT8_RESERVE_MIB left over. A larger GGML_SYCL_ROT8_OTHER_MIB
+    // then just keeps what fits instead of pushing the device past its memory (past it the driver spills into host RAM).
+    if (!room_for(ggml_sycl_get_device(), (size_t) N * K * 9)) {
         return;
     }
     const int nblk = K / BL;
