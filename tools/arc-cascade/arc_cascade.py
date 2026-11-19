@@ -153,7 +153,8 @@ def plan(a):
                 spare = vram[0] - (m['exps'] + fixed(FAST_PROMPT_BATCH) - one_card_less + RESERVE_MIB) - 3000
                 L('fast prompt reading: on (%.0f%% of the weights are dense quantized; their 8-bit copy needs about %.0f MiB of '
                   'card memory, about %.0f MiB is spare%s; prompt chunks of %d tokens)' % (100 * q_share, need, max(0, spare),
-                  '' if spare >= need else ', so only part of it is kept and the gain is smaller', FAST_PROMPT_BATCH))
+                  '' if spare >= need else ', so the rest is converted again on every pass (a little slower than a kept copy)',
+                  FAST_PROMPT_BATCH))
         elif q_share >= 0.5:
             L('fast prompt reading: off (%s)' % ('--no-fast-prompt' if a.fast_prompt is False else
                 'the %d-token chunk does not fit next to everything else' % FAST_PROMPT_BATCH))
