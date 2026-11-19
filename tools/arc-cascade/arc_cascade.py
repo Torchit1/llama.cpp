@@ -25,6 +25,9 @@ RESERVE_MIB = 600                             # per card, left free
 TWO_CARD_MARGIN_MIB = 4000                    # extra room when the cache is split over cards (one run so far, at 32000)
 WIDE_PASS_MIB = 700                           # working memory of a wide (up to 128-token) checking pass
 MiB = 2 ** 20
+# bits per weight of the ggml quant types, to estimate how many weights a file holds (ggml type id -> bits)
+BITS_PER_WEIGHT = {2: 4.5, 3: 5.0, 6: 5.5, 7: 6.0, 8: 8.5, 10: 2.625, 11: 3.4375, 12: 4.5, 13: 5.5, 14: 6.5625, 16: 2.0625,
+                   17: 2.3125, 18: 3.0625, 19: 1.5625, 20: 4.5, 21: 3.4375, 22: 2.5625, 23: 4.25, 29: 1.75, 39: 4.25}
 FAST_PROMPT_BATCH = 4096
 
 def gguf_tensors(path):
@@ -59,13 +62,15 @@ def gguf_tensors(path):
 
 def sizes(path):
     files = sorted(glob.glob(path.replace('-00001-of-', '-*-of-'))) if '-00001-of-' in path else [path]
-    s = {'exps': 0, 'lazy': 0, 'other': 0, 'q4_0': 0}
+    s = {'exps': 0, 'lazy': 0, 'other': 0, 'q4_0': 0, 'quant': 0, 'quant_params': 0}
     for f in files:
         for name, nbytes, ty in gguf_tensors(f):
             k = 'exps' if '_exps.' in name else ('lazy' if 'per_layer_token_embd' in name else 'other')
             s[k] += nbytes
             if ty == 2 and k == 'other': s['q4_0'] += nbytes   # ggml type 2 = Q4_0, dense weights only
-    return {k: v / MiB for k, v in s.items()}
+            if k == 'other' and ty not in (0, 1, 30):            # dense quantized weights (not F32 / F16 / BF16)
+                s['quant'] += nbytes; s['quant_params'] += nbytes * 8 / BITS_PER_WEIGHT.get(ty, 4.5)
+    return {k: (v / MiB if k != 'quant_params' else v) for k, v in s.items()}
 
 def free_ram_mib():
     for l in open('/proc/meminfo'):
@@ -129,17 +134,27 @@ def plan(a):
     if whole - one_card_less + RESERVE_MIB <= vram[0]:
         L('plan: everything on the %s (%.0f of %d MiB)' % (cards[0], whole, vram[0]))
         out['args'] += ['-ngl', '99', '-lm', 'dio']
-        # Fast prompt reading (18 Nov): a dense Q4_0 model reads prompts through 8-bit matmuls in chunks of 4,096 tokens
-        # (27B on a B70: 1,347 -> 1,889 t/s on a 19K prompt). On when most of the weights are dense Q4_0 and the bigger
-        # chunk's working memory still fits; --fast-prompt / --no-fast-prompt decide otherwise.
+        # Fast prompt reading: dense quantized weights read prompts through 8-bit matmuls in chunks of 4,096 tokens. Q4_0 is
+        # read directly (27B on a B70: 1,347 -> 1,889 t/s on a 19K prompt); every other quant type is converted once into
+        # an 8-bit copy kept in free card memory (~1 byte per weight; what does not fit keeps the normal path). Correct on
+        # all 20 quant types in the op tests; llama-2 7B on a B70 (19 Nov): Q4_0 +36%, Q4_K_M / Q5_K_M / Q6_K / Q8_0 +15-16%.
+        # On when most weights are dense quantized and the bigger chunk fits; --fast-prompt / --no-fast-prompt decide otherwise.
+        q_share = m['quant'] / max(1.0, m['exps'] + m['other'])
         q4_share = m['q4_0'] / max(1.0, m['exps'] + m['other'])
         fits = m['exps'] + fixed(FAST_PROMPT_BATCH) - one_card_less + RESERVE_MIB <= vram[0]
-        fast = a.fast_prompt if a.fast_prompt is not None else (q4_share >= 0.5 and fits)
+        fast = a.fast_prompt if a.fast_prompt is not None else (q_share >= 0.5 and fits)
         if fast:
             out['env']['GGML_SYCL_Q4_0_ROT8'] = '1'
             out['args'] += ['-b', str(FAST_PROMPT_BATCH), '-ub', str(FAST_PROMPT_BATCH)]
-            L('fast prompt reading: on (%.0f%% of the weights are dense Q4_0; prompt chunks of %d tokens)' % (100 * q4_share, FAST_PROMPT_BATCH))
-        elif q4_share >= 0.5:
+            if q4_share >= 0.5:
+                L('fast prompt reading: on (%.0f%% of the weights are dense Q4_0, read directly; prompt chunks of %d tokens)' % (100 * q4_share, FAST_PROMPT_BATCH))
+            else:
+                need = (m['quant'] - m['q4_0']) / max(1.0, m['quant']) * m['quant_params'] / MiB
+                spare = vram[0] - (m['exps'] + fixed(FAST_PROMPT_BATCH) - one_card_less + RESERVE_MIB) - 3000
+                L('fast prompt reading: on (%.0f%% of the weights are dense quantized; their 8-bit copy needs about %.0f MiB of '
+                  'card memory, about %.0f MiB is spare%s; prompt chunks of %d tokens)' % (100 * q_share, need, max(0, spare),
+                  '' if spare >= need else ', so only part of it is kept and the gain is smaller', FAST_PROMPT_BATCH))
+        elif q_share >= 0.5:
             L('fast prompt reading: off (%s)' % ('--no-fast-prompt' if a.fast_prompt is False else
                 'the %d-token chunk does not fit next to everything else' % FAST_PROMPT_BATCH))
         return out
