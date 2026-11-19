@@ -39,6 +39,9 @@ static void launch_gated_delta_net_esimd(const float *   q,
                                          int64_t         s_row_stride,
                                          dpct::queue_ptr stream) {
     constexpr int S_v = 128;
+    // GGML_SYCL_GDN_PF=d (default 2, 0 = off): prefetch token t+d's q and k rows and v into L1 while token t runs
+    static const int pf_env = [] { const char * e = getenv("GGML_SYCL_GDN_PF"); return e ? atoi(e) : 2; }();
+    const int        pf     = pf_env;
     stream->parallel_for(
         sycl::nd_range<3>(sycl::range<3>((size_t) n_seqs, (size_t) H, S_v), sycl::range<3>(1, 1, 16)),
         [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
@@ -57,6 +60,18 @@ static void launch_gated_delta_net_esimd(const float *   q,
             float *          attn      = dst + (sequence * n_tokens * H + h_idx) * S_v + col;
 
             for (int t = 0; t < n_tokens; ++t) {
+                // one column per work-group prefetches: all columns of a head read the same q and k rows
+                if (pf > 0 && t + pf < n_tokens && (col & 15) == 0) {
+                    constexpr properties pp{ cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached> };
+                    const int     tp = t + pf;
+                    const float * qp = q + iq3 * sq3 + tp * sq2 + iq1 * sq1;
+                    const float * kp = k + iq3 * sq3 + tp * sq2 + iq1 * sq1;
+                    prefetch<float, 64>(qp, pp);
+                    prefetch<float, 64>(qp + 64, pp);
+                    prefetch<float, 64>(kp, pp);
+                    prefetch<float, 64>(kp + 64, pp);
+                    prefetch<float, 16>(v + sequence * sv3 + tp * sv2 + h_idx * sv1 + col, pp);
+                }
                 const simd<float, S_v> q_t      = block_load<float, S_v>(q + iq3 * sq3 + t * sq2 + iq1 * sq1);
                 const simd<float, S_v> k_t      = block_load<float, S_v>(k + iq3 * sq3 + t * sq2 + iq1 * sq1);
                 const float            v_val    = v[sequence * sv3 + t * sv2 + h_idx * sv1 + col];
