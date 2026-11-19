@@ -88,5 +88,20 @@ at a time, and the `Level Zero v2` adapter.
 
 ## What to report
 
-Card, driver and oneAPI version, model and quant, the plan the launcher printed, decode and prompt t/s, free RAM
-before and during the run, and whether the answer to a fixed prompt matches a run with everything on a card or on CPU.
+The quickest way: run the report script on any GGUF you have, and paste the file it writes.
+
+    source /opt/intel/oneapi/setvars.sh
+    python3 tools/arc-cascade/arc_report.py --model /path/to/model.gguf
+
+- It picks the first Intel Arc card llama-server lists (`--cards` picks another), prints the launcher's plan, starts the
+  server, and runs a short fixed test: a code answer twice (cold and warm), a prose answer, and a ~4,000-token prompt.
+- It takes about 5 minutes for a model that fits the card, up to 15 for a big tiered one.
+- It writes `arc-cascade-report-<date>.md` in the current folder: OS, kernel, CPU, RAM size, GPUs, sycl-ls (driver and
+  runtime versions), the commit you built, the model file name and size, the plan and the speeds. No host name, user name
+  or folder paths. Read it before sharing.
+- Options: `--head` for an MTP draft head, `--bin` if llama-server is not in `build/bin`, `--ctx`, and
+  `--launcher-args "..."` for launcher options such as `--ram-mib 12000`.
+
+By hand, the useful facts are the same: card, driver and oneAPI version, model and quant, the plan the launcher printed,
+decode and prompt t/s, free RAM before and during the run, and whether the answer to a fixed prompt matches a run with
+everything on a card or on CPU.
