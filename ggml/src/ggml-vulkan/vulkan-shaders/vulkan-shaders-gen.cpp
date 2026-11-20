@@ -738,6 +738,9 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
                     merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+                // Intel Xe2: 8x16x16 tiles
+                string_to_spv("flash_attn_f32_f16_m8", "flash_attn_cm1.comp",
+                    merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}, {"FA_COOPMAT_M8", "1"}}), fp16, true, false, f16acc);
 
                 std::map<std::string, std::string> fa_flip_dict = fa_base_dict;
                 fa_flip_dict.erase("DATA_A_IQ4_NL");

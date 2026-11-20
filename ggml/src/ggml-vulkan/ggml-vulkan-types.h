@@ -764,6 +764,9 @@ struct vk_device_struct {
     bool coopmat_support_16x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
     bool coopmat1_fa_support {};
+    bool coopmat_fa_m8 {};               // FA coopmat1 with 8x16x16 tiles (Intel Xe2 has no 16x16x16)
+    bool coopmat_8x16x16_f16acc {};
+    bool coopmat_8x16x16_f32acc {};
     uint32_t coopmat_m;
     uint32_t coopmat_n;
     uint32_t coopmat_k;

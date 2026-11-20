@@ -1296,7 +1296,7 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     const uint32_t D = hsk | hsv;
 
     const uint32_t coopmat_block_rows = 16;
-    const uint32_t coopmat_block_cols = 16;
+    const uint32_t coopmat_block_cols = device->coopmat_fa_m8 ? 8 : 16;
 
     const uint32_t num_subgroups = 4;
 
@@ -1391,6 +1391,10 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
         path = FA_SCALAR;
     }
 
+    if (path == FA_COOPMAT1 && device->coopmat_fa_m8 && k_type == GGML_TYPE_BF16) {
+        // the 8x16x16 variant is built for f16 K/V only
+        path = FA_SCALAR;
+    }
     if (path == FA_COOPMAT1 && device->architecture == vk_device_architecture::NVIDIA_TURING) {
         // Nvidia compiler bug, see https://github.com/ggml-org/llama.cpp/pull/19075#issuecomment-3820716090
         path = FA_SCALAR;
@@ -1398,7 +1402,8 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 
     if (path == FA_COOPMAT1) {
         bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
-                        (!f32acc && device->coopmat_support_16x16x16_f16acc);
+                        (!f32acc && device->coopmat_support_16x16x16_f16acc) ||
+                        (device->coopmat_fa_m8 && (f32acc ? device->coopmat_8x16x16_f32acc : device->coopmat_8x16x16_f16acc));
         vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc, qk_ratio, allow_flip);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type);
         if (!shmem_ok && params.flip) {
@@ -2368,6 +2373,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (f32acc) { spv_data = flash_attn_f32_f16_flip_cm1_data;        spv_size = flash_attn_f32_f16_flip_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_flip_f16acc_cm1_data; spv_size = flash_attn_f32_f16_flip_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_flip_cm1" : "flash_attn_f32_f16_flip_cm1";
+            } else if (device->coopmat_fa_m8) {
+                if (f32acc) { spv_data = flash_attn_f32_f16_m8_cm1_data;        spv_size = flash_attn_f32_f16_m8_cm1_len; }
+                else        { spv_data = flash_attn_f32_f16_m8_f16acc_cm1_data; spv_size = flash_attn_f32_f16_m8_f16acc_cm1_len; }
+                name = aligned ? "flash_attn_f32_f16_aligned_m8_cm1" : "flash_attn_f32_f16_m8_cm1";
             } else {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
@@ -5112,6 +5121,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f32acc = true;
                         }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_8x16x16_f32acc = true;
+                        }
                     } else if ((vk::ComponentTypeKHR)prop.CType == vk::ComponentTypeKHR::eFloat16 &&
                                (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eFloat16) {
                         // coopmat sizes not set yet
@@ -5126,6 +5138,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         }
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f16acc = true;
+                        }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_8x16x16_f16acc = true;
                         }
                     }
                 } else if ((vk::ComponentTypeKHR)prop.AType      == vk::ComponentTypeKHR::eSint8 &&
@@ -5167,6 +5182,11 @@ vk_device ggml_vk_get_device(size_t idx) {
                 GGML_LOG_DEBUG("ggml_vulkan: WARNING: No suitable matrix core mode found. Disabling matrix cores.\n");
                 device->coopmat_support = false;
             }
+            // Intel Xe2 only has 8x16x16 f16 tiles: use the FA coopmat1 variant built for them
+            // (GGML_VK_DISABLE_FA_M8 keeps the scalar FA path)
+            device->coopmat_fa_m8 = device->coopmat_support && !device->coopmat_support_16x16x16_f32acc &&
+                                    !device->coopmat_support_16x16x16_f16acc && device->coopmat_8x16x16_f32acc &&
+                                    getenv("GGML_VK_DISABLE_FA_M8") == nullptr;
         }
 
         if (device->coopmat_support) {
@@ -8534,7 +8554,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
 
-    const uint32_t MatBr = 16, MatBc = 16;
+    const uint32_t MatBr = 16, MatBc = device->coopmat_fa_m8 ? 8 : 16;
 
     const uint32_t row_split = Bc / MatBc;
 
@@ -8567,7 +8587,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     uint32_t pvsh = 0;
     if (Br <= MatBr) {
         const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16) ? 16u : f16vec4;
-        const uint32_t osh_stride = params.row_split * MatBr / 4;
+        const uint32_t osh_stride = params.row_split * MatBc / 4;
         pvsh = Br * osh_stride * pvsh_elem_size;
     }
 
@@ -8811,7 +8831,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                  tensor_aligned_with(k, 16u) && tensor_aligned_with(v, 16u);
     bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
                                  mask != nullptr && mask->type == GGML_TYPE_F16;
-    xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype;
+    // GGML_VK_DISABLE_XE_FA: force the generic flash-attn path (the Intel Xe FA kernel is slower on some head dims)
+    static const bool xe_fa_disabled = getenv("GGML_VK_DISABLE_XE_FA") != nullptr;
+    xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype && !xe_fa_disabled;
     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
     vk_pipeline xe_fa_pipeline = nullptr;
     size_t size_q_staging = 0;
