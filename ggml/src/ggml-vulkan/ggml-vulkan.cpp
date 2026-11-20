@@ -8833,7 +8833,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                  mask != nullptr && mask->type == GGML_TYPE_F16;
     // GGML_VK_DISABLE_XE_FA: force the generic flash-attn path (the Intel Xe FA kernel is slower on some head dims)
     static const bool xe_fa_disabled = getenv("GGML_VK_DISABLE_XE_FA") != nullptr;
-    xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype && !xe_fa_disabled;
+    // Skip the Intel Xe FA kernel for coopmat m8 at prefill (head dim >= 256): m8 is 1.18-1.45x faster there.
+    xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype && !xe_fa_disabled &&
+                !(vk_dev->coopmat_fa_m8 && neq0 >= 256 && neq1 > 1);
     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
     vk_pipeline xe_fa_pipeline = nullptr;
     size_t size_q_staging = 0;
